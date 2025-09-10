@@ -1,0 +1,31 @@
+{
+  "name": "life-nextcloud-sync",
+  "version": "1.0.0",
+  "description": "LiFE Nextcloud Sync",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron .",
+    "build": "electron-builder"
+  },
+  "author": "valueerror",
+  "license": "ISC",
+  "build": {
+    "appId": "eu.life-edu.lifenextcloudsync",
+    "productName": "LiFE Nextcloud Sync",
+    "icon": "icon.png",
+    "linux": {
+      "target": "AppImage",
+      "category": "Utility"
+    }
+  },
+  "devDependencies": {
+    "@electron/universal": "^2.0.1",
+    "electron": "^38.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "bootstrap": "^5.3.8",
+    "webdav": "^5.8.0"
+  }
+}
