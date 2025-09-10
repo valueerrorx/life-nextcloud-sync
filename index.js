@@ -22,7 +22,7 @@ function createWindow() {
   win = new BrowserWindow({
     title: "My Electron App",
     width: 600,
-    height: 650,
+    height: 680,
     icon: path.join(__dirname, 'icon.png'),
     webPreferences:{  
       preload: path.join(__dirname, 'preload.js')
@@ -78,7 +78,7 @@ app.whenReady().then(() => {
 
 
 
-ipcMain.handle('login', async (event, { server, username, password }) => {
+ipcMain.handle('login', async (event, { server, username, password, interval }) => {
   
     const base = `${server.replace(/\/+$/,'')}/remote.php/dav/files/${encodeURIComponent(username)}/`
     client = createClient(base, { username, password })
@@ -90,7 +90,7 @@ ipcMain.handle('login', async (event, { server, username, password }) => {
         if (!fssync.existsSync(localRoot)) fssync.mkdirSync(localRoot,{recursive:true})
 
         // Sync asynchron starten → blockiert UI nicht
-        setImmediate(() => startSync(client, localRoot))
+        setImmediate(() => startSync(client, localRoot, interval))
 
         return { status:'sync-loop-started' }
     } 
@@ -101,7 +101,7 @@ ipcMain.handle('login', async (event, { server, username, password }) => {
 })
 
 // eigene Sync-Funktion
-async function startSync(client, localRoot) {
+async function startSync(client, localRoot, interval) {
     try {
         await fullDownload(client, localRoot)
         await fullUpload(client, localRoot)
@@ -110,7 +110,7 @@ async function startSync(client, localRoot) {
                 await fullDownload(client, localRoot)
                 await fullUpload(client, localRoot)
             } catch (e) { console.error('Interval sync failed:', e?.message) }
-        }, 4 * 60 * 1000)
+        }, interval * 60 * 1000)
     } catch (e) {
         console.error('Initial sync failed:', e?.message)
     }
@@ -133,6 +133,7 @@ app.on('before-quit', async () => {
 const TIMESTAMP_TOLERANCE = 2000 // 2 seconds tolerance for timestamp differences
 
 async function fullDownload(client, localRoot) {
+    console.log('Syncing from Nextcloud to local...')
     await downloadDir(client, '', localRoot)                    // recursive download
 }
 
@@ -162,6 +163,7 @@ async function downloadDir(client, remoteRel, localRoot) {
 }
 
 async function fullUpload(client, localRoot) {
+    console.log('Syncing from local to Nextcloud...')
     await uploadDir(client, localRoot, '')                      // recursive upload
 }
 
