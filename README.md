@@ -18,6 +18,7 @@ git clone git@github.com:valueerrorx/life-nextcloud-sync.git
 cd life-nextcloud-sync
 npm install
 npm run dev / npm run build
+```
 
 # technologies used
 * electron
