@@ -32,17 +32,17 @@
 
         <!-- Sync Interval Slider -->
      
-        <div class="mb-3 px-3">
-            <label for="interval" class="form-label text-muted fs-7">
-              Sync interval: <span id="intervalValue">4</span> minutes
-            </label>
-            <input 
-              type="range" 
-              class="form-range" 
-              min="1" max="10" value="4" 
-              id="interval" 
-              oninput="updateIntervalValue(this.value)">
-          </div>
+    <div class="mb-3 px-3">
+      <label for="interval" class="form-label text-muted fs-7">
+        Sync interval: <span id="intervalValue">0.5</span> minutes
+      </label>
+      <input
+        type="range"
+        class="form-range"
+        min="0.5" max="10" step="0.5" value="0.5"
+        id="interval"
+        oninput="updateIntervalValue(this.value)">
+    </div>
           
 
 
@@ -54,27 +54,180 @@
       <span class="text-muted"></span>
     </div>
 
+    <!-- Loading indicator -->
+    <div id="loadingIndicator" class="text-center mt-4" style="display: none;">
+      <div class="spinner-border spinner-border-sm text-primary" role="status">
+        <span class="visually-hidden">Loading...</span>
+      </div>
+      <span class="ms-2 text-muted">Sync läuft...</span>
+    </div>
+
+    <!-- Info icon (bottom right) -->
+    <div id="infoIcon" class="position-fixed" style="bottom: 20px; right: 20px; z-index: 1000; cursor: pointer;" onclick="toggleStatusOverlay()">
+      <div class="bg-primary text-white rounded-circle d-flex align-items-center justify-content-center" style="width: 50px; height: 50px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>
+        </svg>
+      </div>
+    </div>
+
+    <!-- Status overlay -->
+    <div id="statusOverlay" class="position-fixed" style="top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 2000; display: none;" onclick="closeStatusOverlay()">
+      <div class="position-absolute" style="top: 50%; left: 50%; transform: translate(-50%, -50%); width: 80%; max-width: 600px; max-height: 80%;" onclick="event.stopPropagation()">
+        <div class="bg-white rounded shadow-lg">
+          <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
+            <h5 class="mb-0">Status-Historie</h5>
+            <button type="button" class="btn-close" onclick="closeStatusOverlay()"></button>
+          </div>
+          <div id="statusHistoryContent" class="p-3" style="max-height: 400px; overflow-y: auto;">
+            <!-- Status messages will be inserted here -->
+          </div>
+          <div class="p-3 border-top">
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="statusHistory.clear(); closeStatusOverlay()">Alle löschen</button>
+            <span class="ms-3 text-muted small" id="statusCount">0 Meldungen</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <script>
+        // Status object to store all status messages
+        const statusHistory = {
+            messages: [],
+            maxMessages: 50, // Keep last 50 messages
+            
+            add(message, type = 'info') {
+                const timestamp = new Date().toLocaleTimeString()
+                this.messages.unshift({
+                    timestamp,
+                    message,
+                    type,
+                    id: Date.now() + Math.random()
+                })
+                
+                // Keep only the last maxMessages
+                if (this.messages.length > this.maxMessages) {
+                    this.messages = this.messages.slice(0, this.maxMessages)
+                }
+                
+                this.updateDisplay()
+            },
+            
+            updateDisplay() {
+                const statusDiv = document.getElementById("status")
+                const loadingIndicator = document.getElementById("loadingIndicator")
+                
+                if (this.messages.length === 0) {
+                    statusDiv.innerHTML = ""
+                    return
+                }
+                
+                // Show the latest message
+                const latest = this.messages[0]
+                let alertClass = "alert-info"
+                if (latest.type === "error") alertClass = "alert-danger"
+                else if (latest.type === "warning") alertClass = "alert-warning"
+                else if (latest.type === "ok" || latest.type === "success") alertClass = "alert-success"
+                
+                statusDiv.innerHTML = `<div class="alert ${alertClass}">${latest.message}</div>`
+                
+                // Only hide loading indicator when sync is successful or failed
+                if (latest.type === "ok" || latest.type === "success" || latest.type === "error") {
+                    loadingIndicator.style.display = "none"
+                }
+            },
+            
+            clear() {
+                this.messages = []
+                this.updateDisplay()
+            },
+            
+            // Debug function to log all messages
+            logAll() {
+                console.log("Status History:", this.messages)
+                return this.messages
+            },
+            
+            // Get messages by type
+            getByType(type) {
+                return this.messages.filter(msg => msg.type === type)
+            },
+            
+            // Update overlay content
+            updateOverlay() {
+                const content = document.getElementById("statusHistoryContent")
+                const count = document.getElementById("statusCount")
+                
+                if (!content || !count) return
+                
+                if (this.messages.length === 0) {
+                    content.innerHTML = '<div class="text-muted text-center py-3">Keine Meldungen</div>'
+                    count.textContent = "0 Meldungen"
+                    return
+                }
+                
+                count.textContent = `${this.messages.length} Meldungen`
+                
+                const html = this.messages.map(msg => {
+                    let alertClass = "alert-info"
+                    if (msg.type === "error") alertClass = "alert-danger"
+                    else if (msg.type === "warning") alertClass = "alert-warning"
+                    else if (msg.type === "ok" || msg.type === "success") alertClass = "alert-success"
+                    
+                    return `
+                        <div class="alert ${alertClass} mb-2" style="font-size: 0.9em;">
+                            <div class="d-flex justify-content-between align-items-start">
+                                <div>
+                                    <strong>${msg.timestamp}</strong><br>
+                                    ${msg.message}
+                                </div>
+                            </div>
+                        </div>
+                    `
+                }).join('')
+                
+                content.innerHTML = html
+            }
+        }
+
+        // Overlay functions
+        function toggleStatusOverlay() {
+            const overlay = document.getElementById("statusOverlay")
+            if (overlay.style.display === "none") {
+                statusHistory.updateOverlay()
+                overlay.style.display = "block"
+            } else {
+                overlay.style.display = "none"
+            }
+        }
+
+        function closeStatusOverlay() {
+            document.getElementById("statusOverlay").style.display = "none"
+        }
+
         function updateIntervalValue(val){
             document.getElementById("intervalValue").textContent = val
+        }
+
+        function updateIntervalValue(val) { // show 1 decimal
+            document.getElementById('intervalValue').textContent = Number(val).toFixed(1) // 0.5 steps
         }
 
         function connect(){
             const server   = document.getElementById("server").value
             const username = document.getElementById("username").value
             const password = document.getElementById("password").value
-            const interval = parseInt(document.getElementById("interval").value, 10)
+            const interval = parseFloat(document.getElementById("interval").value)
 
             ipcRenderer.invoke("login", { server, username, password, interval }).then((answer) => {
                 console.log("Backend Response:", answer)
             })
         }
         ipcRenderer.on("login-result", (event, result) => {
-            const statusDiv = document.getElementById("status")
             const btn = document.querySelector("#loginForm button")
 
             if (result.status === "ok") {
-                statusDiv.innerHTML = `<div class="alert alert-success">${result.message}</div>`
+                statusHistory.add(result.message, "success")
                 document.querySelectorAll("#loginForm input").forEach(el => el.disabled = true)
 
                 // change button look
@@ -84,8 +237,21 @@
                 btn.disabled = true
             } 
             else {
-                statusDiv.innerHTML = `<div class="alert alert-danger">${result.message}</div>`
+                statusHistory.add(result.message, "error")
             }
+        })
+
+
+        ipcRenderer.on("sync-result", (event, result) => {
+            // Add message to status history
+            statusHistory.add(result.message, result.status)
+        })
+
+        ipcRenderer.on("sync-start", (event) => {
+            const loadingIndicator = document.getElementById("loadingIndicator")
+            
+            // Show loading indicator
+            loadingIndicator.style.display = "block"
         })
 
     </script>

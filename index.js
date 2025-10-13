@@ -21,11 +21,40 @@ let consecutiveErrors = 0 // Error counter
 let baseInterval = null // Minutes
 let currentInterval = null // Minutes
 let skipRemoteDeletionOnce = null // one-cycle debounce for remote deletions
+let readOnlyWarned = new Set() // remember warned dirs per session
+
 
 
 const MAX_CONSECUTIVE_ERRORS = 3 // Backoff threshold
 const BACKOFF_MULTIPLIER = 2 // Exponential factor
 const TIMESTAMP_TOLERANCE = 5000 // 5s tolerance
+
+// Files and patterns to exclude from sync
+const SYNC_EXCLUSIONS = [
+  '.sync-state.json',           // Local sync metadata
+  'node_modules',               // Node.js dependencies
+  '.conflict-',                // Conflict files (pattern)
+  '.DS_Store',                 // macOS system files
+  'Thumbs.db',                  // Windows thumbnails
+  'desktop.ini',               // Windows system files
+  '.git',                      // Git repository
+  '.vscode',                   // VS Code settings
+  '.idea',                     // IntelliJ/WebStorm settings
+  '*.tmp',                     // Temporary files
+  '*.log'                      // Log files
+]
+
+// Helper function to check if a path should be excluded
+function shouldExcludePath(path) {
+  return SYNC_EXCLUSIONS.some(exclusion => {
+    if (exclusion.includes('*')) {
+      // Handle wildcard patterns
+      const pattern = exclusion.replace(/\*/g, '.*')
+      return new RegExp(pattern).test(path)
+    }
+    return path.includes(exclusion)
+  })
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -132,7 +161,10 @@ async function confirmMassDeletion(title, count, preview) {
 }
 
 
-
+function isPermissionError(error) { // detect read-only/permission issues
+  const s = error?.response?.status || 0 // HTTP status
+  return s === 401 || s === 403 || s === 405 || s === 423 // typical WebDAV perms
+}
 
 
 
@@ -141,6 +173,10 @@ async function confirmMassDeletion(title, count, preview) {
 async function performSync() {
     if (isSyncing) { console.log('Sync already running, skipping'); return }
     isSyncing = true
+    
+    // Notify frontend that sync is starting
+    win?.webContents?.send('sync-start')
+    
     try {
       await reconcileRemoteDeletions(client, localRoot) // may skip applying but never blocks
       await fullUpload(client, localRoot) // push
@@ -152,8 +188,9 @@ async function performSync() {
         if (syncTimer) clearInterval(syncTimer)
         syncTimer = setInterval(() => { performSync().catch(e => console.error('Unhandled sync error:', e?.message)) }, currentInterval * 60 * 1000)
         console.log(`Connection restored, sync interval reset to ${currentInterval}min`)
+        win?.webContents?.send('sync-result', { status: 'info', message: `Verbindung wiederhergestellt - Sync-Intervall zurückgesetzt auf ${currentInterval}min` })
       }
-      win?.webContents?.send('sync-status', { status: 'ok', message: 'Sync erfolgreich' })
+      win?.webContents?.send('sync-result', { status: 'ok', message: 'Sync erfolgreich' })
     } catch (e) {
       consecutiveErrors++
       const msg = e?.message || 'Unknown error'
@@ -165,9 +202,10 @@ async function performSync() {
         if (syncTimer) clearInterval(syncTimer)
         syncTimer = setInterval(() => { performSync().catch(err => console.error('Unhandled sync error:', err?.message)) }, currentInterval * 60 * 1000)
         console.log(`Slowing down sync to every ${currentInterval} minutes due to errors`)
-        win?.webContents?.send('sync-status', { status: 'warning', message: `Verbindungsprobleme - Sync verlangsamt auf ${currentInterval}min` })
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Sync verlangsamt auf ${currentInterval}min aufgrund von Fehlern` })
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Verbindungsprobleme - Sync verlangsamt auf ${currentInterval}min` })
       } else {
-        win?.webContents?.send('sync-status', { status: 'error', message: `Sync Fehler (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})` })
+        win?.webContents?.send('sync-result', { status: 'error', message: `Sync Fehler (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})` })
       }
     } finally {
       isSyncing = false
@@ -211,8 +249,11 @@ app.on('before-quit', async () => {
 // ---------- Download ----------
 async function fullDownload(client, localRoot) {
   console.log('Syncing from Nextcloud to local...') // Log
+  win?.webContents?.send('sync-result', { status: 'info', message: 'Download von Nextcloud...' })
   await downloadDir(client, '', localRoot) // Recurse root
 }
+
+
 
 async function downloadDir(client, remoteRel, localRoot) {
   try {
@@ -220,7 +261,7 @@ async function downloadDir(client, remoteRel, localRoot) {
     for (const item of list) {
       try {
         const rel = item.filename.replace(/^\//,'') // Normalize
-        if (rel.includes('.conflict-')) continue // Skip conflict artifacts
+        if (shouldExcludePath(rel)) continue // Skip excluded files and patterns
         const abs = path.join(localRoot, rel) // Local path
 
         if (item.type === 'directory') {
@@ -234,6 +275,7 @@ async function downloadDir(client, remoteRel, localRoot) {
             const remoteTime = new Date(item.lastmod) // Remote mtime
             await fs.utimes(abs, remoteTime, remoteTime) // Set mtime
             console.log(`Downloaded: ${rel}`) // Log
+            win?.webContents?.send('sync-result', { status: 'info', message: `Heruntergeladen: ${rel}` })
           }
         }
       } catch (e) {
@@ -245,6 +287,10 @@ async function downloadDir(client, remoteRel, localRoot) {
     throw e // Bubble up
   }
 }
+
+
+
+
 
 async function shouldDownload(localPath, remoteItem) {
   try {
@@ -258,6 +304,7 @@ async function shouldDownload(localPath, remoteItem) {
       const buf = await client.getFileContents(remoteItem.filename) // Read remote
       await fs.writeFile(conflictName, buf) // Save conflict copy
       console.log(`Conflict: saved remote version as ${path.basename(conflictName)}`) // Log
+      win?.webContents?.send('sync-result', { status: 'warning', message: `Konflikt: Remote-Version als ${path.basename(conflictName)} gespeichert` })
       return false // Keep local (local wins)
     }
     return false // Similar or local newer
@@ -266,88 +313,125 @@ async function shouldDownload(localPath, remoteItem) {
   }
 }
 
-// ---------- Upload (with local deletions handling) ----------
+
+
+
+// FULL FUNCTION (modified): handles read-only errors in delete loop
 async function fullUpload(client, localRoot) {
-  console.log('Syncing from local to Nextcloud...') // Log
-  const state = await loadSyncState() // Load previous state
-  const localPaths = new Set() // Collect current local files (POSIX)
-  await uploadDir(client, localRoot, '', localPaths) // Walk & upload
+  console.log('Syncing from local to Nextcloud...') // log
+  win?.webContents?.send('sync-result', { status: 'info', message: 'Upload zu Nextcloud...' })
+  const state = await loadSyncState() // load state
+  const localPaths = new Set() // current local files
+  await uploadDir(client, localRoot, '', localPaths) // walk & upload
 
-  const toDelete = [] // Build delete list from knownFiles that disappeared locally
+  const toDelete = [] // files vanished locally
   for (const knownPath in state.knownFiles) {
-    if (!localPaths.has(knownPath) && !knownPath.includes('.conflict-')) toDelete.push(knownPath) // Missing local file
+    if (!localPaths.has(knownPath) && !shouldExcludePath(knownPath)) toDelete.push(knownPath) // collect
   }
 
-  if (toDelete.length > 0) { // Ask confirmation for local deletions
-    const proceed = await confirmMassDeletion('Lokale Löschung erkannt', toDelete.length, toDelete.slice(0, 10)) // Confirm
-    if (!proceed) return // Abort without deleting remotely
+  if (toDelete.length > 0) { // confirm remote deletes
+    const proceed = await confirmMassDeletion('Lokale Löschung erkannt', toDelete.length, toDelete.slice(0, 10)) // ask
+    if (!proceed) return // skip deletes
   }
 
-  for (const knownPath of toDelete) { // Delete remote files
+  for (const knownPath of toDelete) { // attempt remote delete
     try {
-      await client.deleteFile('/' + knownPath) // Delete
-      console.log(`Deleted on remote: ${knownPath}`) // Log
-      delete state.knownFiles[knownPath] // Update state
+      await client.deleteFile('/' + knownPath) // delete
+      console.log(`Deleted on remote: ${knownPath}`) // log
+      win?.webContents?.send('sync-result', { status: 'info', message: `Remote gelöscht: ${knownPath}` })
+      delete state.knownFiles[knownPath] // update state
     } catch (e) {
-      console.warn(`Could not delete remote ${knownPath}:`, e?.message) // Warn
+      if (isPermissionError(e)) { // read-only share
+        const dirRel = path.posix.dirname(knownPath) || '/' // dir
+        if (!readOnlyWarned.has(dirRel)) { // warn once per dir
+          readOnlyWarned.add(dirRel) // remember
+          win?.webContents?.send('sync-result', { status: 'warning', message: `Kein Schreibrecht in „/${dirRel}“ – Remote-Löschungen werden dort übersprungen` }) // notify
+        }
+        console.warn(`Skip remote delete (read-only): ${knownPath}`) // warn
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Remote-Löschung übersprungen (read-only): ${knownPath}` })
+        continue // keep syncing
+      }
+      console.warn(`Could not delete remote ${knownPath}:`, e?.message) // other error
+      win?.webContents?.send('sync-result', { status: 'warning', message: `Remote-Löschung fehlgeschlagen: ${knownPath}` })
     }
   }
 
-  state.knownFiles = {} // Refresh knownFiles to current local set
-  for (const p of localPaths) state.knownFiles[p] = true // Record presence
-
-  await saveSyncState(state) // Persist state
+  state.knownFiles = {} // refresh known files
+  for (const p of localPaths) state.knownFiles[p] = true // record
+  await saveSyncState(state) // persist
 }
 
 
 
 
 
+
+
+
+// FULL FUNCTION (modified): skips uploads on 401/403/405/423, warns once per dir
 async function uploadDir(client, localRoot, rel, localPaths) {
-    try {
-      const absDir = path.join(localRoot, rel) // local dir
-      const entries = await fs.readdir(absDir, { withFileTypes: true }) // entries
-  
-      for (const e of entries) {
-        try {
-          if (e.name.includes('.conflict-')) continue // skip conflicts
-          const nextRel = path.posix.join(rel, e.name) // POSIX rel
-  
-          if (e.isDirectory()) {
-            // do NOT create remote dir here; recurse and only create if a file is uploaded
-            await uploadDir(client, localRoot, nextRel, localPaths) // recurse
-          } else {
-            localPaths.add(nextRel) // remember file presence
-            const localPath = path.join(localRoot, nextRel) // local file
-  
-            if (await shouldUpload(client, localPath, '/' + nextRel)) { // decide upload
-              // lazily ensure parent dir exists only when we actually upload a file
-              const parentPosix = path.posix.dirname('/' + nextRel) // remote parent
-              if (parentPosix && parentPosix !== '/' && parentPosix !== '.') {
-                await ensureRemoteDir(client, parentPosix) // ensure parent
-              }
-  
-              const data = await fs.readFile(localPath) // read file
+  try {
+    const absDir = path.join(localRoot, rel) // local dir
+    const entries = await fs.readdir(absDir, { withFileTypes: true }) // list
+
+    for (const e of entries) {
+      try {
+        if (shouldExcludePath(e.name)) continue // skip excluded files
+        const nextRel = path.posix.join(rel, e.name) // POSIX rel
+
+        if (e.isDirectory()) {
+          await uploadDir(client, localRoot, nextRel, localPaths) // recurse
+        } else {
+          localPaths.add(nextRel) // remember file
+          const localPath = path.join(localRoot, nextRel) // abs path
+
+          if (await shouldUpload(client, localPath, '/' + nextRel)) { // decide upload
+            const parentPosix = path.posix.dirname('/' + nextRel) // remote parent
+            if (parentPosix && parentPosix !== '/' && parentPosix !== '.') {
+              await ensureRemoteDir(client, parentPosix) // ensure parent
+            }
+
+            try {
+              const data = await fs.readFile(localPath) // read local
               await client.putFileContents('/' + nextRel, data, { overwrite: true }) // upload
-  
+
               try {
                 const remoteStats = await client.stat('/' + nextRel) // remote stat
-                const remoteTime = new Date(remoteStats.lastmod) // remote mtime
+                const remoteTime = new Date(remoteStats.lastmod) // mtime
                 await fs.utimes(localPath, remoteTime, remoteTime) // align mtime
-              } catch { console.warn(`Could not sync timestamp for ${nextRel}`) } // warn
-  
-              console.log(`Uploaded: ${nextRel}`) // log
+              } catch { 
+                console.warn(`Could not sync timestamp for ${nextRel}`) // warn
+                win?.webContents?.send('sync-result', { status: 'warning', message: `Zeitstempel-Sync fehlgeschlagen: ${nextRel}` })
+              }
+
+              console.log(`Uploaded: ${nextRel}`) // ok
+              win?.webContents?.send('sync-result', { status: 'info', message: `Hochgeladen: ${nextRel}` })
+            } catch (e) {
+              if (isPermissionError(e)) { // read-only share
+                const dirRel = path.posix.dirname(nextRel) || '/' // dir
+                if (!readOnlyWarned.has(dirRel)) { // warn once
+                  readOnlyWarned.add(dirRel) // mark
+                  win?.webContents?.send('sync-result', { status: 'warning', message: `Kein Schreibrecht in „/${dirRel}“ – Uploads werden dort übersprungen` }) // notify
+                }
+                console.warn(`Skipped (read-only): ${nextRel}`) // log skip
+                win?.webContents?.send('sync-result', { status: 'warning', message: `Upload übersprungen (read-only): ${nextRel}` })
+                continue // keep loop
+              }
+              console.error(`Error uploading ${nextRel}:`, e?.message) // other error
+              continue // keep loop
             }
           }
-        } catch (e) {
-          console.error(`Error processing ${e.name}:`, e?.message) // per-entry error
         }
+      } catch (e) {
+        console.error(`Error processing ${e.name}:`, e?.message) // per-entry error
       }
-    } catch (e) {
-      if (!isNetworkError(e)) console.error(`Error uploading dir ${rel}:`, e?.message) // non-network error
-      throw e // bubble up
     }
+  } catch (e) {
+    if (!isNetworkError(e)) console.error(`Error uploading dir ${rel}:`, e?.message) // non-network
+    throw e // bubble to adjust backoff
   }
+}
+
   
 
 async function shouldUpload(client, localPath, remotePath) {
@@ -364,7 +448,11 @@ async function shouldUpload(client, localPath, remotePath) {
         const backupPath = await generateRemoteConflictName(remotePath) // Backup path
         await client.copyFile(remotePath, backupPath) // Backup
         console.log(`Conflict: backed up remote to ${backupPath}`) // Log
-      } catch (e) { console.warn(`Could not backup remote file:`, e?.message) } // Warn
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Konflikt: Remote-Backup erstellt: ${backupPath}` })
+      } catch (e) { 
+        console.warn(`Could not backup remote file:`, e?.message) // Warn
+        win?.webContents?.send('sync-result', { status: 'warning', message: 'Remote-Backup fehlgeschlagen' })
+      }
       return true // Upload local anyway
     }
     return false // Similar
@@ -380,7 +468,7 @@ async function collectRemoteTree(client) {
       const list = await client.getDirectoryContents('/' + rel)
       for (const item of list) {
         const relPath = item.filename.replace(/^\//, '')
-        if (relPath.includes('.conflict-')) continue
+        if (shouldExcludePath(relPath)) continue
         if (item.type === 'directory') { dirs.add(relPath); await walk(relPath) } else { files.add(relPath) }
       }
     }
@@ -397,7 +485,7 @@ async function collectLocalDirs(localRoot) {
     async function walk(abs, rel) {
       const entries = await fs.readdir(abs, { withFileTypes: true })
       for (const e of entries) {
-        if (e.name.includes('.conflict-')) continue
+        if (shouldExcludePath(e.name)) continue
         if (e.isDirectory()) { const nextRel = path.posix.join(rel, e.name); result.add(nextRel); await walk(path.join(abs, e.name), nextRel) }
       }
     }
@@ -416,7 +504,7 @@ async function reconcileRemoteDeletions(client, localRoot) {
     // files missing on remote
     const toDeleteLocalFiles = []
     for (const knownPath in state.knownFiles) {
-      if (!remoteFiles.has(knownPath) && !knownPath.includes('.conflict-')) {
+      if (!remoteFiles.has(knownPath) && !shouldExcludePath(knownPath)) {
         try { await fs.stat(path.join(localRoot, knownPath)); toDeleteLocalFiles.push(knownPath) } catch {}
       }
     }
@@ -440,13 +528,27 @@ async function reconcileRemoteDeletions(client, localRoot) {
         if (!proceed) { skipRemoteDeletionOnce = fp; return } // remember for this cycle, continue sync
         // proceed: apply deletions now
         for (const relPath of toDeleteLocalFiles) {
-          try { await fs.unlink(path.join(localRoot, relPath)); delete state.knownFiles[relPath]; console.log(`Deleted locally (remote removed file): ${relPath}`) }
-          catch (e) { console.warn(`Could not delete local file ${relPath}:`, e?.message) }
+          try { 
+            await fs.unlink(path.join(localRoot, relPath)); delete state.knownFiles[relPath]; 
+            console.log(`Deleted locally (remote removed file): ${relPath}`)
+            win?.webContents?.send('sync-result', { status: 'info', message: `Lokal gelöscht (Remote entfernt): ${relPath}` })
+          }
+          catch (e) { 
+            console.warn(`Could not delete local file ${relPath}:`, e?.message)
+            win?.webContents?.send('sync-result', { status: 'warning', message: `Lokale Datei-Löschung fehlgeschlagen: ${relPath}` })
+          }
         }
         toDeleteLocalDirs.sort((a,b) => b.split('/').length - a.split('/').length)
         for (const dirRel of toDeleteLocalDirs) {
-          try { await pruneEmptyDirTree(localRoot, dirRel); console.log(`Deleted locally (remote removed dir): ${dirRel}`) }
-          catch (e) { console.warn(`Could not delete local dir ${dirRel}:`, e?.message) }
+          try { 
+            await pruneEmptyDirTree(localRoot, dirRel); 
+            console.log(`Deleted locally (remote removed dir): ${dirRel}`)
+            win?.webContents?.send('sync-result', { status: 'info', message: `Lokales Verzeichnis gelöscht (Remote entfernt): ${dirRel}` })
+          }
+          catch (e) { 
+            console.warn(`Could not delete local dir ${dirRel}:`, e?.message)
+            win?.webContents?.send('sync-result', { status: 'warning', message: `Lokale Verzeichnis-Löschung fehlgeschlagen: ${dirRel}` })
+          }
         }
         await saveSyncState(state) // persist updated knownFiles
       }
