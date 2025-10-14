@@ -84,7 +84,20 @@ function createTray() {
   tray.on('click', () => { win.isVisible() ? win.hide() : win.show() }) // Toggle window
 }
 
-app.whenReady().then(() => { createWindow(); createTray() }) // Init app
+// Ensure single instance: focus existing window and exit second instance
+const gotTheLock = app.requestSingleInstanceLock()
+if (!gotTheLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    if (win) {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    }
+  })
+  app.whenReady().then(() => { createWindow(); createTray() }) // Init app
+}
 
 ipcMain.handle('login', async (event, { server, username, password, interval }) => {
   if (syncTimer) clearInterval(syncTimer) // Prevent duplicate timers
