@@ -22,12 +22,31 @@ let baseInterval = null // Minutes
 let currentInterval = null // Minutes
 let skipRemoteDeletionOnce = null // one-cycle debounce for remote deletions
 let readOnlyWarned = new Set() // remember warned dirs per session
+let stopUploadsDueToQuota = false // skip further uploads this cycle after 507
 
 
 
 const MAX_CONSECUTIVE_ERRORS = 3 // Backoff threshold
 const BACKOFF_MULTIPLIER = 2 // Exponential factor
 const TIMESTAMP_TOLERANCE = 5000 // 5s tolerance
+
+// Process-level hardening to avoid crashes on EPIPE and similar
+process.on('uncaughtException', (err) => {
+  const code = err && (err.code || err.errno || '')
+  if (code === 'EPIPE') {
+    console.warn('Suppressed uncaught EPIPE in main process')
+    return
+  }
+  console.error('Uncaught exception:', err?.message || err)
+})
+process.on('unhandledRejection', (reason) => {
+  const code = reason && (reason.code || reason.errno || '')
+  if (code === 'EPIPE') {
+    console.warn('Suppressed unhandledRejection EPIPE in main process')
+    return
+  }
+  console.error('Unhandled promise rejection:', reason?.message || reason)
+})
 
 // Files and patterns to exclude from sync
 const SYNC_EXCLUSIONS = [
@@ -159,18 +178,23 @@ async function startSync() {
 
 // ---------- Confirmation helper ----------
 async function confirmMassDeletion(title, count, preview) {
-  const detailList = preview.map(p => `• ${p}`).join('\n') // Build preview lines
-  const { response, checkboxChecked } = await dialog.showMessageBox(win ?? null, { // Show modal
-    type: 'warning', // Warning dialog
-    buttons: ['Abbrechen', 'Fortfahren'], // Buttons
-    defaultId: 0, // Default to cancel
-    cancelId: 0, // Esc cancels
-    title, // Title
-    message: `${count} Dateien werden gelöscht. Fortfahren?`, // Short message
-    detail: detailList.length ? `Beispiele:\n${detailList}` : undefined, // Show first items
-    noLink: true // Native button style
-  })
-  return response === 1 // true if "Fortfahren"
+  try {
+    const detailList = preview.map(p => `• ${p}`).join('\n') // Build preview lines
+    const { response } = await dialog.showMessageBox(win ?? null, { // Show modal
+      type: 'warning', // Warning dialog
+      buttons: ['Abbrechen', 'Fortfahren'], // Buttons
+      defaultId: 0, // Default to cancel
+      cancelId: 0, // Esc cancels
+      title, // Title
+      message: `${count} Dateien werden gelöscht. Fortfahren?`, // Short message
+      detail: detailList.length ? `Beispiele:\n${detailList}` : undefined, // Show first items
+      noLink: true // Native button style
+    })
+    return response === 1 // true if "Fortfahren"
+  } catch (e) {
+    console.warn('Deletion confirmation dialog failed, treating as cancel:', e?.message)
+    return false
+  }
 }
 
 
@@ -205,19 +229,26 @@ async function performSync() {
       }
       win?.webContents?.send('sync-result', { status: 'ok', message: 'Sync erfolgreich' })
     } catch (e) {
-      consecutiveErrors++
+      const quotaExceeded = isQuotaError(e)
+      if (quotaExceeded) {
+        // Do not penalize with backoff; surface clear message
+        win?.webContents?.send('sync-result', { status: 'warning', message: 'Speicher voll auf dem Server (507) – Uploads übersprungen' })
+        consecutiveErrors = 0
+      } else {
+        consecutiveErrors++
+      }
       const msg = e?.message || 'Unknown error'
       const code = e?.code || ''
       console.error(`Sync failed (attempt ${consecutiveErrors}):`, msg, code)
       if (isNetworkError(e)) isConnected = false
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      if (!quotaExceeded && consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         currentInterval = Math.min(currentInterval * BACKOFF_MULTIPLIER, 60)
         if (syncTimer) clearInterval(syncTimer)
         syncTimer = setInterval(() => { performSync().catch(err => console.error('Unhandled sync error:', err?.message)) }, currentInterval * 60 * 1000)
         console.log(`Slowing down sync to every ${currentInterval} minutes due to errors`)
         win?.webContents?.send('sync-result', { status: 'warning', message: `Sync verlangsamt auf ${currentInterval}min aufgrund von Fehlern` })
         win?.webContents?.send('sync-result', { status: 'warning', message: `Verbindungsprobleme - Sync verlangsamt auf ${currentInterval}min` })
-      } else {
+      } else if (!quotaExceeded) {
         win?.webContents?.send('sync-result', { status: 'error', message: `Sync Fehler (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS})` })
       }
     } finally {
@@ -241,6 +272,11 @@ function isNetworkError(error) {
   const code = error?.code || '' // Code
   const status = error?.response?.status || 0 // HTTP status
   return networkCodes.includes(code) || status >= 500 || status === 423 // Treat as transient
+}
+
+function isQuotaError(error) { // Nextcloud/WebDAV quota exceeded
+  const status = error?.response?.status || 0
+  return status === 507
 }
 
 app.on('before-quit', async () => { 
@@ -335,6 +371,7 @@ async function fullUpload(client, localRoot) {
   win?.webContents?.send('sync-result', { status: 'info', message: 'Upload zu Nextcloud...' })
   const state = await loadSyncState() // load state
   const localPaths = new Set() // current local files
+  stopUploadsDueToQuota = false // reset at start of upload phase
   await uploadDir(client, localRoot, '', localPaths) // walk & upload
 
   const toDelete = [] // files vanished locally
@@ -389,6 +426,9 @@ async function uploadDir(client, localRoot, rel, localPaths) {
 
     for (const e of entries) {
       try {
+        if (stopUploadsDueToQuota) { // short-circuit uploads for this cycle
+          break
+        }
         if (shouldExcludePath(e.name)) continue // skip excluded files
         const nextRel = path.posix.join(rel, e.name) // POSIX rel
 
@@ -429,6 +469,14 @@ async function uploadDir(client, localRoot, rel, localPaths) {
                 console.warn(`Skipped (read-only): ${nextRel}`) // log skip
                 win?.webContents?.send('sync-result', { status: 'warning', message: `Upload übersprungen (read-only): ${nextRel}` })
                 continue // keep loop
+              }
+              if (isQuotaError(e)) {
+                if (!stopUploadsDueToQuota) {
+                  stopUploadsDueToQuota = true
+                  console.warn('Server storage exhausted (507). Skipping remaining uploads this cycle.')
+                  win?.webContents?.send('sync-result', { status: 'warning', message: 'Server-Speicher erschöpft (507) – restliche Uploads werden übersprungen' })
+                }
+                continue
               }
               console.error(`Error uploading ${nextRel}:`, e?.message) // other error
               continue // keep loop
