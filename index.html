@@ -4,6 +4,25 @@
     <title>LiFE Nextcloud Sync</title>
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self';">
     <link rel="stylesheet" href="./node_modules/bootstrap/dist/css/bootstrap.min.css">
+    <style>
+      body {
+ 
+        opacity: 0.95;
+ 
+        z-index: 1000;
+
+        background-image: url(background.png);
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        backdrop-filter: blur(10px);
+        -webkit-backdrop-filter: blur(10px);
+        -moz-backdrop-filter: blur(10px);
+        background-color: #f0f0f0;
+      
+      }
+
+    </style>
   </head>
   
   <body class="d-flex flex-column align-items-center justify-content-start vh-100 bg-light pt-5">
@@ -30,24 +49,30 @@
           <input type="password" id="password" class="form-control" placeholder="Password">
         </div>
 
-        <!-- Sync Interval Slider -->
-     
-    <div class="mb-3 px-3">
-      <label for="interval" class="form-label text-muted fs-7">
-        Sync interval: <span id="intervalValue">0.5</span> minutes
-      </label>
-      <input
-        type="range"
-        class="form-range"
-        min="0.5" max="10" step="0.5" value="0.5"
-        id="interval"
-        oninput="updateIntervalValue(this.value)">
-    </div>
           
 
 
         <button type="submit" class="btn btn-primary w-100">Verbinden</button>
     </form>
+    
+    <!-- Sync Buttons (hidden initially) -->
+    <div id="syncButtons" class="card shadow p-4 mb-3" style="width: 320px; display: none;">
+        <h5 class="text-center mb-3">Sync-Optionen</h5>
+        <div class="d-grid gap-2">
+            <button id="syncDownBtn" class="btn btn-success" onclick="syncDown()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="me-2">
+                    <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+                </svg>
+                Sync Down (Server → Lokal)
+            </button>
+            <button id="syncUpBtn" class="btn btn-primary" onclick="syncUp()">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="me-2">
+                    <path d="M19 15h-4v4H9v-4H5l7-7 7 7zM5 18v2h14v-2H5z"/>
+                </svg>
+                Sync Up (Lokal → Server)
+            </button>
+        </div>
+    </div>
   
     <!-- fixed-height status div -->
     <div id="status" class="text-center" style="height: 2.5rem;">
@@ -55,12 +80,7 @@
     </div>
 
     <!-- Loading indicator -->
-    <div id="loadingIndicator" class="text-center mt-4" style="display: none;">
-      <div class="spinner-border spinner-border-sm text-primary" role="status">
-        <span class="visually-hidden">Loading...</span>
-      </div>
-      <span class="ms-2 text-muted">Sync läuft...</span>
-    </div>
+    
 
     <!-- Info icon (bottom right) -->
     <div id="infoIcon" class="position-fixed" style="bottom: 20px; right: 20px; z-index: 1000; cursor: pointer;" onclick="toggleStatusOverlay()">
@@ -95,6 +115,7 @@
         const statusHistory = {
             messages: [],
             maxMessages: 50, // Keep last 50 messages
+            persistentWarning: false, // Track if we have a persistent warning/error
             
             add(message, type = 'info') {
                 const timestamp = new Date().toLocaleTimeString()
@@ -113,12 +134,19 @@
                 this.updateDisplay()
             },
             
+            // Reset persistent warning when starting a new sync
+            resetPersistentWarning() {
+                this.persistentWarning = false
+            },
+            
             updateDisplay() {
                 const statusDiv = document.getElementById("status")
-                const loadingIndicator = document.getElementById("loadingIndicator")
+                //const loadingIndicator = document.getElementById("loadingIndicator")
+                const infoIcon = document.getElementById("infoIcon")
                 
                 if (this.messages.length === 0) {
                     statusDiv.innerHTML = ""
+                    this.updateInfoIcon('info') // Reset to default
                     return
                 }
                 
@@ -131,9 +159,56 @@
                 
                 statusDiv.innerHTML = `<div class="alert ${alertClass}">${latest.message}</div>`
                 
-                // Only hide loading indicator when sync is successful or failed
-                if (latest.type === "ok" || latest.type === "success" || latest.type === "error") {
-                    loadingIndicator.style.display = "none"
+                // Check for persistent warnings/errors
+                if (latest.type === "warning" || latest.type === "error") {
+                    this.persistentWarning = true
+                }
+                
+                // Update info icon - use persistent warning if available, otherwise latest message
+                const iconType = this.persistentWarning ? 
+                    (this.getHighestPriorityType() || latest.type) : 
+                    latest.type
+                this.updateInfoIcon(iconType)
+                
+           
+            },
+            
+            // Get the highest priority type (error > warning > success > info)
+            getHighestPriorityType() {
+                for (const message of this.messages) {
+                    if (message.type === "error") return "error"
+                    if (message.type === "warning") return "warning"
+                }
+                return null
+            },
+            
+            updateInfoIcon(type) {
+                const infoIcon = document.getElementById("infoIcon")
+                const iconDiv = infoIcon.querySelector('div')
+                const iconSvg = infoIcon.querySelector('svg')
+                
+                // Reset classes
+                iconDiv.className = "rounded-circle d-flex align-items-center justify-content-center"
+                iconDiv.style.width = "50px"
+                iconDiv.style.height = "50px"
+                iconDiv.style.boxShadow = "0 2px 10px rgba(0,0,0,0.2)"
+                
+                if (type === "warning") {
+                    // Yellow warning triangle
+                    iconDiv.classList.add("bg-warning", "text-dark")
+                    iconSvg.innerHTML = '<path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/>'
+                } else if (type === "error") {
+                    // Red error circle
+                    iconDiv.classList.add("bg-danger", "text-white")
+                    iconSvg.innerHTML = '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5 11H7v-2h10v2z"/>'
+                } else if (type === "ok" || type === "success") {
+                    // Green success circle
+                    iconDiv.classList.add("bg-success", "text-white")
+                    iconSvg.innerHTML = '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>'
+                } else {
+                    // Default blue info circle
+                    iconDiv.classList.add("bg-primary", "text-white")
+                    iconSvg.innerHTML = '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/>'
                 }
             },
             
@@ -205,21 +280,13 @@
             document.getElementById("statusOverlay").style.display = "none"
         }
 
-        function updateIntervalValue(val){
-            document.getElementById("intervalValue").textContent = val
-        }
-
-        function updateIntervalValue(val) { // show 1 decimal
-            document.getElementById('intervalValue').textContent = Number(val).toFixed(1) // 0.5 steps
-        }
 
         function connect(){
             const server   = document.getElementById("server").value
             const username = document.getElementById("username").value
             const password = document.getElementById("password").value
-            const interval = parseFloat(document.getElementById("interval").value)
 
-            ipcRenderer.invoke("login", { server, username, password, interval }).then((answer) => {
+            ipcRenderer.invoke("login", { server, username, password }).then((answer) => {
                 console.log("Backend Response:", answer)
             })
         }
@@ -235,6 +302,9 @@
                 btn.classList.remove("btn-primary")
                 btn.classList.add("btn-success")
                 btn.disabled = true
+                
+                // show sync buttons
+                document.getElementById("syncButtons").style.display = "block"
             } 
             else {
                 statusHistory.add(result.message, "error")
@@ -248,11 +318,45 @@
         })
 
         ipcRenderer.on("sync-start", (event) => {
-            const loadingIndicator = document.getElementById("loadingIndicator")
+            //const loadingIndicator = document.getElementById("loadingIndicator")
+            
+            // Reset persistent warning when starting new sync
+            statusHistory.resetPersistentWarning()
             
             // Show loading indicator
-            loadingIndicator.style.display = "block"
+            //loadingIndicator.style.display = "block"
         })
+        
+        // Sync functions
+        function syncDown() {
+            const btn = document.getElementById("syncDownBtn")
+            btn.disabled = true
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Sync Down läuft...'
+            
+            ipcRenderer.invoke("sync-down").then((result) => {
+                btn.disabled = false
+                btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="me-2"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>Sync Down (Server → Lokal)'
+                
+                if (result.status === "error") {
+                    statusHistory.add(`Sync Down Fehler: ${result.message}`, "error")
+                }
+            })
+        }
+        
+        function syncUp() {
+            const btn = document.getElementById("syncUpBtn")
+            btn.disabled = true
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Sync Up läuft...'
+            
+            ipcRenderer.invoke("sync-up").then((result) => {
+                btn.disabled = false
+                btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="me-2"><path d="M19 15h-4v4H9v-4H5l7-7 7 7zM5 18v2h14v-2H5z"/></svg>Sync Up (Lokal → Server)'
+                
+                if (result.status === "error") {
+                    statusHistory.add(`Sync Up Fehler: ${result.message}`, "error")
+                }
+            })
+        }
 
     </script>
   </body>
