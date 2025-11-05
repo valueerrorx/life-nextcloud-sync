@@ -276,14 +276,25 @@ async function performSyncUp() {
       }
       
       // Delete files on server
+      const deleteReadOnlyWarned = new Set() // Track warned directories
       for (const filePath of filesToDelete) {
         try {
           await client.deleteFile('/' + filePath)
           console.log(`Deleted on server: ${filePath}`)
           win?.webContents?.send('sync-result', { status: 'info', message: `Am Server gelöscht: ${filePath}` })
         } catch (e) {
-          console.warn(`Could not delete ${filePath} on server:`, e?.message)
-          win?.webContents?.send('sync-result', { status: 'warning', message: `Server-Löschung fehlgeschlagen: ${filePath}` })
+          if (isPermissionError(e)) { // Permission error
+            const dirRel = path.posix.dirname(filePath) || '/' // Directory path
+            if (!deleteReadOnlyWarned.has(dirRel)) { // Warn once per directory
+              deleteReadOnlyWarned.add(dirRel) // Mark as warned
+              win?.webContents?.send('sync-result', { status: 'warning', message: `Kein Löschrecht in „/${dirRel}" – Löschungen werden dort übersprungen` }) // Notify
+            }
+            console.warn(`Skipped deletion (read-only): ${filePath}`) // Log skip
+            win?.webContents?.send('sync-result', { status: 'warning', message: `Löschung übersprungen (read-only): ${filePath}` })
+          } else {
+            console.warn(`Could not delete ${filePath} on server:`, e?.message) // Other error
+            win?.webContents?.send('sync-result', { status: 'warning', message: `Server-Löschung fehlgeschlagen: ${filePath}` })
+          }
         }
       }
     }
