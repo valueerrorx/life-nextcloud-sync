@@ -1,6 +1,6 @@
 {
   "name": "life-nextcloud-sync",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "LiFE Nextcloud Sync",
   "main": "index.js",
   "type": "module",
