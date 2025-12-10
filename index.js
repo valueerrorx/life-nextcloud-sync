@@ -17,6 +17,7 @@ let isSyncing = false // Re-entrancy lock
 let isConnected = false // Connection status
 
 const TIMESTAMP_TOLERANCE = 5000 // 5s tolerance
+const APP_VERSION = '1.0.4' // Application version
 
 // Process-level hardening to avoid crashes on EPIPE and similar
 process.on('uncaughtException', (err) => {
@@ -183,6 +184,10 @@ ipcMain.handle('logout', async () => {
   return { status: 'logged-out' } // Ack
 })
 
+ipcMain.handle('get-version', async () => {
+  return { version: APP_VERSION } // Return app version
+})
+
 // New sync handlers
 ipcMain.handle('sync-down', async () => {
   if (!client) return { status: 'no-client' } // Guard
@@ -210,7 +215,7 @@ ipcMain.handle('sync-up', async () => {
   }
 })
 
-// Initial sync function - overwrites local files without warning
+// Initial sync function - downloads files with timestamp check
 async function performInitialSyncDown() {
   if (isSyncing) { console.log('Sync already running, skipping'); return }
   isSyncing = true
@@ -220,7 +225,7 @@ async function performInitialSyncDown() {
   try {
     console.log('Initial sync from Nextcloud to local...')
     win?.webContents?.send('sync-result', { status: 'info', message: 'Initialer Download von Nextcloud...' })
-    await downloadDirForce(client, '', localRoot)
+    await downloadDir(client, '', localRoot)
     console.log('✅ Initialer Sync abgeschlossen')
     win?.webContents?.send('sync-result', { status: 'ok', message: 'Initialer Sync abgeschlossen' })
   } catch (e) {
@@ -426,39 +431,6 @@ async function shouldDownload(localPath, remoteItem) {
     return timeDiff > TIMESTAMP_TOLERANCE // Download if remote is newer
   } catch {
     return true // Local missing → download
-  }
-}
-
-// Force download function - overwrites local files without checking timestamps
-async function downloadDirForce(client, remoteRel, localRoot) {
-  try {
-    const list = await client.getDirectoryContents('/' + remoteRel) // List dir
-    for (const item of list) {
-      try {
-        const rel = item.filename.replace(/^\//,'') // Normalize
-        if (shouldExcludePath(rel)) continue // Skip excluded files and patterns
-        const abs = path.join(localRoot, rel) // Local path
-
-        if (item.type === 'directory') {
-          await fs.mkdir(abs, { recursive: true }) // Ensure dir
-          await downloadDirForce(client, rel, localRoot) // Recurse
-        } else {
-          // Force download - always overwrite local files
-          const buf = await client.getFileContents('/' + rel) // Read remote
-          await fs.mkdir(path.dirname(abs), { recursive: true }) // Ensure parent
-          await fs.writeFile(abs, buf) // Write file
-          const remoteTime = new Date(item.lastmod) // Remote mtime
-          await fs.utimes(abs, remoteTime, remoteTime) // Set mtime
-          console.log(`Force downloaded: ${rel}`) // Log
-          win?.webContents?.send('sync-result', { status: 'info', message: `Heruntergeladen: ${rel}` })
-        }
-      } catch (e) {
-        console.error(`Error processing ${item.filename}:`, e?.message) // Per-item error
-      }
-    }
-  } catch (e) {
-    if (!isNetworkError(e)) console.error(`Error downloading dir ${remoteRel}:`, e?.message) // Non-network error
-    throw e // Bubble up
   }
 }
 
