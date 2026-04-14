@@ -221,11 +221,12 @@ async function performInitialSyncDown() {
   isSyncing = true
   
   win?.webContents?.send('sync-start')
+  const syncState = await loadSyncState() // Fingerprints so Sync Up can skip unchanged files
   
   try {
     console.log('Initial sync from Nextcloud to local...')
     win?.webContents?.send('sync-result', { status: 'info', message: 'Initialer Download von Nextcloud...' })
-    await downloadDir(client, '', localRoot)
+    await downloadDir(client, '', localRoot, syncState)
     console.log('✅ Initialer Sync abgeschlossen')
     win?.webContents?.send('sync-result', { status: 'ok', message: 'Initialer Sync abgeschlossen' })
   } catch (e) {
@@ -234,6 +235,8 @@ async function performInitialSyncDown() {
     win?.webContents?.send('sync-result', { status: 'error', message: `Initialer Sync Fehler: ${msg}` })
     throw e
   } finally {
+    await pruneSyncStateMissingLocals(syncState) // Drop entries for removed paths
+    await saveSyncState(syncState) // Persist fingerprints
     isSyncing = false
   }
 }
@@ -244,11 +247,12 @@ async function performSyncDown() {
   isSyncing = true
   
   win?.webContents?.send('sync-start')
+  const syncState = await loadSyncState() // Keep upload fingerprints aligned with server
   
   try {
     console.log('Syncing from Nextcloud to local...')
     win?.webContents?.send('sync-result', { status: 'info', message: 'Download von Nextcloud...' })
-    await downloadDir(client, '', localRoot)
+    await downloadDir(client, '', localRoot, syncState)
     console.log('✅ Sync Down (Server → Client) abgeschlossen')
     win?.webContents?.send('sync-result', { status: 'ok', message: 'Sync Down erfolgreich' })
   } catch (e) {
@@ -257,6 +261,8 @@ async function performSyncDown() {
     win?.webContents?.send('sync-result', { status: 'error', message: `Sync Down Fehler: ${msg}` })
     throw e
   } finally {
+    await pruneSyncStateMissingLocals(syncState) // Drop entries for removed paths
+    await saveSyncState(syncState) // Persist fingerprints
     isSyncing = false
   }
 }
@@ -266,6 +272,7 @@ async function performSyncUp() {
   isSyncing = true
   
   win?.webContents?.send('sync-start')
+  const syncState = await loadSyncState() // Skip PROPFIND per file when local matches last aligned snapshot
   
   try {
     console.log('Syncing from local to Nextcloud...')
@@ -285,6 +292,7 @@ async function performSyncUp() {
       for (const filePath of filesToDelete) {
         try {
           await client.deleteFile('/' + filePath)
+          delete syncState.files[filePath] // Remove fingerprint so state stays consistent
           console.log(`Deleted on server: ${filePath}`)
           win?.webContents?.send('sync-result', { status: 'info', message: `Am Server gelöscht: ${filePath}` })
         } catch (e) {
@@ -304,7 +312,7 @@ async function performSyncUp() {
       }
     }
     
-    await uploadDir(client, localRoot, '', new Set(), { value: false })
+    await uploadDir(client, localRoot, '', new Set(), { value: false }, syncState)
     console.log('✅ Sync Up (Client → Server) abgeschlossen')
     win?.webContents?.send('sync-result', { status: 'ok', message: 'Sync Up erfolgreich' })
   } catch (e) {
@@ -313,6 +321,8 @@ async function performSyncUp() {
     win?.webContents?.send('sync-result', { status: 'error', message: `Sync Up Fehler: ${msg}` })
     throw e
   } finally {
+    await pruneSyncStateMissingLocals(syncState) // Drop entries for removed paths
+    await saveSyncState(syncState) // Persist fingerprints
     isSyncing = false
   }
 }
@@ -420,6 +430,52 @@ function isQuotaError(error) {
   return status === 507 // Insufficient Storage
 }
 
+const SYNC_STATE_FILE = '.sync-state.json' // Local fingerprint store (excluded from WebDAV sync)
+
+function syncStateFilePath() {
+  return path.join(localRoot, SYNC_STATE_FILE) // Absolute path to state file
+}
+
+async function loadSyncState() {
+  try {
+    const raw = await fs.readFile(syncStateFilePath(), 'utf8') // Read JSON
+    const data = JSON.parse(raw) // Parse
+    if (data && typeof data.files === 'object' && data.files !== null) {
+      return { files: { ...data.files } } // Mutable copy
+    }
+  } catch {
+    // Missing or corrupt → treat as empty
+  }
+  return { files: {} } // Default
+}
+
+async function saveSyncState(state) {
+  const payload = JSON.stringify({ v: 1, files: state.files }, null, 0) // Compact JSON
+  await fs.writeFile(syncStateFilePath(), payload, 'utf8') // Persist
+}
+
+function recordSyncedLocalFile(relPosix, stats, state) {
+  state.files[relPosix] = { size: stats.size, mtimeMs: stats.mtimeMs } // Snapshot after last known alignment
+}
+
+function localMatchesSyncSnapshot(relPosix, stats, state) {
+  const e = state.files[relPosix] // Cached entry
+  if (!e) return false // Unknown → must check remote
+  return e.size === stats.size && e.mtimeMs === stats.mtimeMs // Skip PROPFIND if unchanged locally since last sync
+}
+
+async function pruneSyncStateMissingLocals(state) {
+  for (const rel of Object.keys(state.files)) {
+    const abs = path.join(localRoot, ...rel.split('/')) // Native path from POSIX rel
+    try {
+      const st = await fs.stat(abs) // Exists?
+      if (!st.isFile()) delete state.files[rel] // Not a regular file → drop
+    } catch {
+      delete state.files[rel] // Gone locally → drop
+    }
+  }
+}
+
 // Simplified shouldDownload function
 async function shouldDownload(localPath, remoteItem) {
   try {
@@ -434,7 +490,7 @@ async function shouldDownload(localPath, remoteItem) {
   }
 }
 
-async function downloadDir(client, remoteRel, localRoot) {
+async function downloadDir(client, remoteRel, localRoot, syncState = null) {
   try {
     const list = await client.getDirectoryContents('/' + remoteRel) // List dir
     for (const item of list) {
@@ -445,7 +501,7 @@ async function downloadDir(client, remoteRel, localRoot) {
 
         if (item.type === 'directory') {
           await fs.mkdir(abs, { recursive: true }) // Ensure dir
-          await downloadDir(client, rel, localRoot) // Recurse
+          await downloadDir(client, rel, localRoot, syncState) // Recurse
         } else {
           if (await shouldDownload(abs, item)) { // Decide
             const buf = await client.getFileContents('/' + rel) // Read remote
@@ -453,8 +509,19 @@ async function downloadDir(client, remoteRel, localRoot) {
             await fs.writeFile(abs, buf) // Write file
             const remoteTime = new Date(item.lastmod) // Remote mtime
             await fs.utimes(abs, remoteTime, remoteTime) // Set mtime
+            if (syncState) {
+              const st = await fs.stat(abs) // Local metadata after align
+              recordSyncedLocalFile(rel, st, syncState) // Record for upload fast-path
+            }
             console.log(`Downloaded: ${rel}`) // Log
             win?.webContents?.send('sync-result', { status: 'info', message: `Heruntergeladen: ${rel}` })
+          } else if (syncState) {
+            try {
+              const st = await fs.stat(abs) // Already matches remote — refresh snapshot without re-download
+              recordSyncedLocalFile(rel, st, syncState) // Record for upload fast-path
+            } catch {
+              // Local missing though shouldDownload was false — unusual; skip state
+            }
           }
         }
       } catch (e) {
@@ -468,7 +535,7 @@ async function downloadDir(client, remoteRel, localRoot) {
 }
 
 // Upload function with permission checks
-async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), stopUploadsDueToQuota = { value: false }) {
+async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), stopUploadsDueToQuota = { value: false }, syncState = null) {
   try {
     const absDir = path.join(localRoot, rel) // local dir
     const entries = await fs.readdir(absDir, { withFileTypes: true }) // list
@@ -482,11 +549,15 @@ async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), sto
         const nextRel = path.posix.join(rel, e.name) // POSIX rel
 
         if (e.isDirectory()) {
-          await uploadDir(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota) // recurse
+          await uploadDir(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota, syncState) // recurse
         } else {
           const localPath = path.join(localRoot, nextRel) // abs path
+          const localStats = await fs.stat(localPath) // Single local stat per file
+          if (syncState && localMatchesSyncSnapshot(nextRel, localStats, syncState)) {
+            continue // Unchanged since last aligned sync — skip remote PROPFIND and upload
+          }
 
-          if (await shouldUpload(client, localPath, '/' + nextRel)) { // decide upload
+          if (await shouldUpload(client, localPath, '/' + nextRel, localStats)) { // decide upload
             const parentPosix = path.posix.dirname('/' + nextRel) // remote parent
             if (parentPosix && parentPosix !== '/' && parentPosix !== '.') {
               await ensureRemoteDir(client, parentPosix) // ensure parent
@@ -503,6 +574,11 @@ async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), sto
               } catch { 
                 console.warn(`Could not sync timestamp for ${nextRel}`) // warn
                 win?.webContents?.send('sync-result', { status: 'warning', message: `Zeitstempel-Sync fehlgeschlagen: ${nextRel}` })
+              }
+
+              if (syncState) {
+                const st = await fs.stat(localPath) // Post-upload metadata
+                recordSyncedLocalFile(nextRel, st, syncState) // Persist fast-path fingerprint
               }
 
               console.log(`Uploaded: ${nextRel}`) // ok
@@ -530,6 +606,8 @@ async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), sto
               win?.webContents?.send('sync-result', { status: 'warning', message: `Upload fehlgeschlagen: ${nextRel}` })
               continue // keep loop
             }
+          } else if (syncState) {
+            recordSyncedLocalFile(nextRel, localStats, syncState) // No upload needed; cache for next Sync Up
           }
         }
       } catch (e) {
@@ -543,12 +621,12 @@ async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), sto
 }
 
 // Simplified shouldUpload function
-async function shouldUpload(client, localPath, remotePath) {
+async function shouldUpload(client, localPath, remotePath, localStats = null) {
   try {
-    const localStats = await fs.stat(localPath) // Local stat
+    const localSt = localStats ?? await fs.stat(localPath) // Local stat (reuse when already read)
     const remoteStats = await client.stat(remotePath) // Remote stat
     const remoteTime = new Date(remoteStats.lastmod) // Remote mtime
-    const localTime = new Date(localStats.mtime) // Local mtime
+    const localTime = new Date(localSt.mtime) // Local mtime
     const timeDiff = localTime.getTime() - remoteTime.getTime() // Positive if local newer
 
     return timeDiff > TIMESTAMP_TOLERANCE // Upload if local is newer
