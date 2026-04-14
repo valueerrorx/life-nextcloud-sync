@@ -1,14 +1,14 @@
 # Nextcloud Sync Client
 
-A lightweight Electron-based desktop application that provides background synchronization with a Nextcloud server.  
-Users can log in with their server URL, username, and password, and the app automatically mirrors files to a local folder (`~/Nextcloud-Temp`).
+A lightweight Electron-based desktop application that synchronizes files with a Nextcloud server over WebDAV.  
+After login, files are mirrored under `~/Nextcloud-Temp`; sync is driven by login, manual actions, and app shutdown—not by a background timer.
 
 ## Features
 
 - 🚀 Simple login form with immediate feedback on connection success or failure  
-- 🔄 Automatic background synchronization every 5 minutes  
+- 🔄 **Sync timing:** initial download from the server right after successful login; manual “Sync Down” / “Sync Up” in the UI; upload on graceful shutdown (SIGTERM / SIGINT) while connected—no periodic interval in the app  
 - 🗂️ Local directory created in the user’s home folder  
-- ⚡ Smart file handling: only uploads/downloads files if they are newer locally or on the server  
+- ⚡ Smart file handling: uploads/downloads only when the other copy is newer (mtime comparison with a small tolerance)  
 - 💬 Status messages and UI feedback integrated in the frontend  
 
 ## Installation
