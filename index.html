@@ -6,26 +6,13 @@
     <link rel="stylesheet" href="./node_modules/bootstrap/dist/css/bootstrap.min.css">
     <style>
       body {
- 
-        opacity: 0.95;
- 
-        z-index: 1000;
-
-        background-image: url(background.png);
-        background-size: cover;
-        background-position: center;
-        background-repeat: no-repeat;
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        -moz-backdrop-filter: blur(10px);
-        background-color: #f0f0f0;
-      
+        background-color: #0082c9; /* Nextcloud light blue */
       }
 
     </style>
   </head>
   
-  <body class="d-flex flex-column align-items-center justify-content-start vh-100 bg-light pt-5">
+  <body class="d-flex flex-column align-items-center justify-content-start vh-100 pt-5">
 
     <!-- Nextcloud Logo -->
     <img src="icon.svg" alt="Nextcloud Icon" class="mb-4" width="100">
@@ -52,9 +39,14 @@
           
 
 
+        <div class="form-check mb-3">
+          <input type="checkbox" class="form-check-input" id="selectFolders">
+          <label class="form-check-label" for="selectFolders">📁 Ordner auswählen (nur ausgewählte synchronisieren)</label>
+        </div>
+
         <button type="submit" class="btn btn-primary w-100">Verbinden</button>
     </form>
-    
+
     <!-- Sync Buttons (hidden initially) -->
     <div id="syncButtons" class="card shadow p-4 mb-3" style="width: 320px; display: none;">
         <h5 class="text-center mb-3">Sync-Optionen</h5>
@@ -70,6 +62,9 @@
                     <path d="M19 15h-4v4H9v-4H5l7-7 7 7zM5 18v2h14v-2H5z"/>
                 </svg>
                 Sync Up (Lokal → Server)
+            </button>
+            <button id="manageFoldersBtn" class="btn btn-outline-secondary" onclick="openFolderOverlay()">
+                📁 Ordner verwalten
             </button>
         </div>
     </div>
@@ -110,6 +105,35 @@
           <div class="p-3 border-top">
             <button type="button" class="btn btn-outline-secondary btn-sm" onclick="statusHistory.clear(); closeStatusOverlay()">Alle löschen</button>
             <span class="ms-3 text-muted small" id="statusCount">0 Meldungen</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Folder selection overlay -->
+    <div id="folderOverlay" class="position-fixed" style="top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 2000; display: none;" onclick="closeFolderOverlay()">
+      <div class="position-absolute" style="top: 50%; left: 50%; transform: translate(-50%, -50%); width: 80%; max-width: 480px; max-height: 80%;" onclick="event.stopPropagation()">
+        <div class="bg-white rounded shadow-lg">
+          <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
+            <h5 class="mb-0">Ordner auswählen</h5>
+            <button type="button" class="btn-close" onclick="closeFolderOverlay()"></button>
+          </div>
+          <div class="px-3 pt-3">
+            <p class="text-muted small mb-2">Nur ausgewählte Ordner werden synchronisiert.</p>
+            <div class="d-flex justify-content-between mb-2">
+              <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setAllFolders(true)">Alle</button>
+              <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setAllFolders(false)">Keine</button>
+            </div>
+          </div>
+          <div id="folderList" class="px-3" style="max-height: 360px; overflow-y: auto;">
+            <div class="text-muted text-center py-3">
+              <span class="spinner-border spinner-border-sm me-2"></span>Ordner werden geladen...
+            </div>
+          </div>
+          <div class="p-3 border-top">
+            <button id="applyFoldersBtn" type="button" class="btn btn-primary w-100" onclick="applyFolderSelection()" disabled>
+              Auswahl übernehmen &amp; synchronisieren
+            </button>
           </div>
         </div>
       </div>
@@ -295,8 +319,9 @@
             const server   = document.getElementById("server").value
             const username = document.getElementById("username").value
             const password = document.getElementById("password").value
+            const selectFolders = document.getElementById("selectFolders").checked
 
-            ipcRenderer.invoke("login", { server, username, password }).then((answer) => {
+            ipcRenderer.invoke("login", { server, username, password, selectFolders }).then((answer) => {
                 console.log("Backend Response:", answer)
             })
         }
@@ -305,21 +330,107 @@
 
             if (result.status === "ok") {
                 statusHistory.add(result.message, "success")
-                document.querySelectorAll("#loginForm input").forEach(el => el.disabled = true)
+                document.querySelectorAll("#loginForm input, #loginForm .form-check-input").forEach(el => el.disabled = true)
 
                 // change button look
                 btn.textContent = "Verbunden"
                 btn.classList.remove("btn-primary")
                 btn.classList.add("btn-success")
                 btn.disabled = true
-                
-                // show sync buttons
+
+                // Sync buttons (incl. "Ordner verwalten") are always available once connected
                 document.getElementById("syncButtons").style.display = "block"
-            } 
+
+                if (result.mode === "select-folders") {
+                    // First-time selection: open the folder overlay before any sync runs
+                    openFolderOverlay()
+                }
+            }
             else {
                 statusHistory.add(result.message, "error")
             }
         })
+
+        // ---------- Folder selection ----------
+        function openFolderOverlay() {
+            document.getElementById("folderOverlay").style.display = "block"
+            loadTopFolders()
+        }
+
+        function closeFolderOverlay() {
+            document.getElementById("folderOverlay").style.display = "none"
+        }
+
+        function formatSize(bytes) {
+            if (bytes === null || bytes === undefined) return ""
+            const units = ["B", "KB", "MB", "GB", "TB"]
+            let n = bytes, i = 0
+            while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+            return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`
+        }
+
+        function loadTopFolders() {
+            const listEl = document.getElementById("folderList")
+            const applyBtn = document.getElementById("applyFoldersBtn")
+            // Reset to loading state each time the overlay opens
+            listEl.innerHTML = '<div class="text-muted text-center py-3"><span class="spinner-border spinner-border-sm me-2"></span>Ordner werden geladen...</div>'
+            applyBtn.disabled = true
+            applyBtn.textContent = "Auswahl übernehmen & synchronisieren"
+            ipcRenderer.invoke("list-top-folders").then((result) => {
+                if (result.status !== "ok") {
+                    listEl.innerHTML = `<div class="alert alert-danger">Ordner konnten nicht geladen werden: ${result.message || ""}</div>`
+                    return
+                }
+                if (!result.folders.length) {
+                    listEl.innerHTML = `<div class="text-muted text-center py-3">Keine Ordner gefunden.</div>`
+                    applyBtn.disabled = false
+                    return
+                }
+                // Previously saved selection (null = all selected by default)
+                const saved = result.selected
+                const html = result.folders.map((f, idx) => {
+                    const checked = (saved === null || saved.includes(f.name)) ? "checked" : ""
+                    const size = formatSize(f.size)
+                    return `
+                        <div class="form-check d-flex justify-content-between align-items-center py-1">
+                            <span>
+                                <input type="checkbox" class="form-check-input folder-cb" id="fcb_${idx}" value="${f.name.replace(/"/g, "&quot;")}" ${checked}>
+                                <label class="form-check-label ms-1" for="fcb_${idx}">${f.name}</label>
+                            </span>
+                            <span class="text-muted small">${size}</span>
+                        </div>
+                    `
+                }).join("")
+                listEl.innerHTML = html
+                applyBtn.disabled = false
+            })
+        }
+
+        function setAllFolders(state) {
+            document.querySelectorAll(".folder-cb").forEach(cb => cb.checked = state)
+        }
+
+        function applyFolderSelection() {
+            const folders = Array.from(document.querySelectorAll(".folder-cb"))
+                .filter(cb => cb.checked)
+                .map(cb => cb.value)
+
+            const btn = document.getElementById("applyFoldersBtn")
+            btn.disabled = true
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Synchronisiere...'
+
+            ipcRenderer.invoke("set-selected-folders", { folders }).then((result) => {
+                if (result.status === "ok") {
+                    closeFolderOverlay()
+                    document.getElementById("syncButtons").style.display = "block"
+                    statusHistory.add(`Ordnerauswahl gespeichert (${folders.length}) – Sync startet`, "info")
+                } else {
+                    statusHistory.add(`Ordnerauswahl fehlgeschlagen: ${result.message || ""}`, "error")
+                }
+                btn.disabled = false
+                btn.textContent = "Auswahl übernehmen & synchronisieren"
+            })
+        }
 
 
         ipcRenderer.on("sync-result", (event, result) => {

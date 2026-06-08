@@ -17,7 +17,20 @@ let isSyncing = false // Re-entrancy lock
 let isConnected = false // Connection status
 
 const TIMESTAMP_TOLERANCE = 5000 // 5s tolerance
+const UPLOAD_CONCURRENCY = 12 // Max parallel per-file WebDAV operations during Sync Up
 const APP_VERSION = '1.0.4' // Application version
+
+// Run async tasks with a bounded concurrency limit, preserving no particular order.
+async function runWithConcurrency(items, limit, worker) {
+  let index = 0 // Shared cursor into items
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (index < items.length) {
+      const current = index++ // Claim next item
+      await worker(items[current], current) // Process it
+    }
+  })
+  await Promise.all(runners) // Wait for all lanes to drain
+}
 
 // Process-level hardening to avoid crashes on EPIPE and similar
 process.on('uncaughtException', (err) => {
@@ -76,6 +89,7 @@ process.on('SIGINT', async () => {
 // Files and patterns to exclude from sync
 const SYNC_EXCLUSIONS = [
   '.sync-state.json',           // Local sync metadata
+  '.sync-folders.json',         // Top-level folder selection (local only)
   'node_modules',               // Node.js dependencies
   '.conflict-',                // Conflict files (pattern)
   '.DS_Store',                 // macOS system files
@@ -144,7 +158,7 @@ if (!gotTheLock) {
   app.whenReady().then(() => { createWindow(); createTray() }) // Init app
 }
 
-ipcMain.handle('login', async (event, { server, username, password }) => {
+ipcMain.handle('login', async (event, { server, username, password, selectFolders }) => {
   isSyncing = false // Reset lock
 
   const base = `${server.replace(/\/+$/,'')}/remote.php/dav/files/${encodeURIComponent(username)}/` // Base URL
@@ -153,9 +167,17 @@ ipcMain.handle('login', async (event, { server, username, password }) => {
   try {
     await client.getDirectoryContents('/') // Probe root
     isConnected = true // Mark as connected
-    event.sender.send('login-result', { status:'ok', message:'Login erfolgreich, initialer Sync startet' }) // Notify UI
     if (!fssync.existsSync(localRoot)) fssync.mkdirSync(localRoot,{recursive:true}) // Ensure local root
-    
+    await loadSelectedTopFolders() // Apply any previously saved folder selection
+
+    // Folder-selection mode: don't sync yet — let the UI fetch the folder list and confirm.
+    if (selectFolders) {
+      event.sender.send('login-result', { status:'ok', message:'Login erfolgreich – bitte Ordner auswählen', mode:'select-folders' }) // Notify UI
+      return { status:'logged-in' } // Ack; sync starts after selection
+    }
+
+    event.sender.send('login-result', { status:'ok', message:'Login erfolgreich, initialer Sync startet' }) // Notify UI
+
     // Initial sync down after login - Server to Client only
     setImmediate(async () => {
       try {
@@ -166,7 +188,7 @@ ipcMain.handle('login', async (event, { server, username, password }) => {
         event.sender.send('sync-result', { status:'error', message: `Initialer Sync fehlgeschlagen: ${e?.message}` })
       }
     })
-    
+
     return { status:'logged-in' } // Ack
   } catch (e) {
     const msg = e?.message || 'Login fehlgeschlagen' // Message
@@ -205,12 +227,59 @@ ipcMain.handle('sync-down', async () => {
 ipcMain.handle('sync-up', async () => {
   if (!client) return { status: 'no-client' } // Guard
   if (isSyncing) return { status: 'already-syncing' } // Prevent concurrent syncs
-  
+
   try {
     await performSyncUp()
     return { status: 'success' }
   } catch (e) {
     console.error('Sync up failed:', e?.message)
+    return { status: 'error', message: e?.message }
+  }
+})
+
+// List first-level folders with their (server-computed) recursive size, instantly.
+// Uses a single Depth:1 PROPFIND with details:true and reads Nextcloud's quota-used-bytes,
+// so no recursive scan is needed.
+ipcMain.handle('list-top-folders', async () => {
+  if (!client) return { status: 'no-client' } // Guard
+  try {
+    const list = await client.getDirectoryContents('/', { details: true }) // Raw props per entry
+    const items = list.data ?? list // details:true wraps results in { data }
+    const folders = []
+    for (const item of items) {
+      if (item.type !== 'directory') continue // top-level folders only
+      const name = item.basename || item.filename.replace(/^\/+|\/+$/g, '')
+      if (!name || shouldExcludePath(name)) continue // skip excluded
+      const props = item.props || {}
+      const rawSize = Number(props['quota-used-bytes']) // Nextcloud: recursive bytes used by this folder
+      const size = Number.isFinite(rawSize) && rawSize >= 0 ? rawSize : null // negatives = unknown
+      folders.push({ name, size }) // size may be null if server didn't report it
+    }
+    folders.sort((a, b) => (b.size ?? 0) - (a.size ?? 0)) // Biggest first
+    return { status: 'ok', folders, selected: selectedTopFolders ? [...selectedTopFolders] : null }
+  } catch (e) {
+    console.error('list-top-folders failed:', e?.message)
+    return { status: 'error', message: e?.message }
+  }
+})
+
+// Persist the user's folder selection, then run the initial sync down for the chosen scope.
+// folders === null (or empty array meaning "all") clears the filter and syncs everything.
+ipcMain.handle('set-selected-folders', async (_event, { folders }) => {
+  if (!client) return { status: 'no-client' } // Guard
+  try {
+    await saveSelectedTopFolders(Array.isArray(folders) ? folders : null) // Update + persist
+    setImmediate(async () => {
+      try {
+        await performInitialSyncDown()
+      } catch (e) {
+        console.error('Initial sync failed:', e?.message)
+        win?.webContents?.send('sync-result', { status:'error', message: `Initialer Sync fehlgeschlagen: ${e?.message}` })
+      }
+    })
+    return { status: 'ok' }
+  } catch (e) {
+    console.error('set-selected-folders failed:', e?.message)
     return { status: 'error', message: e?.message }
   }
 })
@@ -378,8 +447,9 @@ async function collectLocalFiles(localRoot, rel, files) {
     
     for (const entry of entries) {
       if (shouldExcludePath(entry.name)) continue
-      
+
       const nextRel = path.posix.join(rel, entry.name)
+      if (isDeselectedTopDir(nextRel, entry.isDirectory()) || !isPathInSelection(nextRel)) continue // ignore deselected top folders
       if (entry.isDirectory()) {
         await collectLocalFiles(localRoot, nextRel, files)
       } else {
@@ -398,7 +468,8 @@ async function collectRemoteFiles(client, rel, files) {
     for (const item of list) {
       const relPath = item.filename.replace(/^\//, '')
       if (shouldExcludePath(relPath)) continue
-      
+      if (isDeselectedTopDir(relPath, item.type === 'directory') || !isPathInSelection(relPath)) continue // ignore deselected top folders (never flag for deletion)
+
       if (item.type === 'directory') {
         await collectRemoteFiles(client, relPath, files)
       } else {
@@ -454,6 +525,70 @@ async function saveSyncState(state) {
   await fs.writeFile(syncStateFilePath(), payload, 'utf8') // Persist
 }
 
+// ---------- Top-level folder selection ----------
+// When enabled, only the selected first-level folders are synced (down + up + delete check).
+// Stored locally; an empty/missing selection means "sync everything" (no filtering).
+const SYNC_FOLDERS_FILE = '.sync-folders.json' // Local selection store (excluded from WebDAV sync)
+
+function syncFoldersFilePath() {
+  return path.join(localRoot, SYNC_FOLDERS_FILE) // Absolute path
+}
+
+// In-memory selection for the current session. null = no filter (sync all).
+// A Set of top-level folder names means: only sync these folders (plus root-level files).
+let selectedTopFolders = null
+
+async function loadSelectedTopFolders() {
+  try {
+    const raw = await fs.readFile(syncFoldersFilePath(), 'utf8') // Read JSON
+    const data = JSON.parse(raw) // Parse
+    if (data && Array.isArray(data.folders)) {
+      selectedTopFolders = new Set(data.folders) // Apply filter
+      return selectedTopFolders
+    }
+  } catch {
+    // Missing or corrupt → no filter
+  }
+  selectedTopFolders = null // Sync everything
+  return null
+}
+
+async function saveSelectedTopFolders(folders) {
+  selectedTopFolders = Array.isArray(folders) ? new Set(folders) : null // Update in-memory
+  if (selectedTopFolders === null) {
+    try { await fs.unlink(syncFoldersFilePath()) } catch { /* nothing to remove */ }
+    return
+  }
+  const payload = JSON.stringify({ v: 1, folders: [...selectedTopFolders] }, null, 0) // Compact JSON
+  await fs.writeFile(syncFoldersFilePath(), payload, 'utf8') // Persist
+}
+
+// Returns the top-level folder name for a POSIX-relative path, or '' for root-level files.
+function topFolderOf(relPosix) {
+  const clean = relPosix.replace(/^\/+/, '') // Strip leading slashes
+  const slash = clean.indexOf('/')
+  return slash === -1 ? '' : clean.slice(0, slash) // First path segment when nested
+}
+
+// Decide whether a given relative path is in scope of the current folder selection.
+// Root-level files (no folder) are always in scope; only top-level folders are filterable.
+function isPathInSelection(relPosix) {
+  if (!selectedTopFolders) return true // No filter active → everything in scope
+  const top = topFolderOf(relPosix)
+  if (top === '') return true // Root-level file/dir entry stays in scope
+  return selectedTopFolders.has(top) // Only selected top folders
+}
+
+// True when relPosix is a top-level *directory* entry (no slash) that was NOT selected,
+// so the directory itself must be skipped entirely (not even created locally).
+// isDir guards against treating a root-level file as a folder.
+function isDeselectedTopDir(relPosix, isDir) {
+  if (!selectedTopFolders || !isDir) return false // No filter, or not a directory
+  const clean = relPosix.replace(/^\/+|\/+$/g, '') // Strip surrounding slashes
+  if (!clean || clean.includes('/')) return false // Not a top-level entry
+  return !selectedTopFolders.has(clean) // Top-level dir not in selection
+}
+
 function recordSyncedLocalFile(relPosix, stats, state) {
   state.files[relPosix] = { size: stats.size, mtimeMs: stats.mtimeMs } // Snapshot after last known alignment
 }
@@ -497,6 +632,7 @@ async function downloadDir(client, remoteRel, localRoot, syncState = null) {
       try {
         const rel = item.filename.replace(/^\//,'') // Normalize
         if (shouldExcludePath(rel)) continue // Skip excluded files and patterns
+        if (isDeselectedTopDir(rel, item.type === 'directory') || !isPathInSelection(rel)) continue // Skip deselected top folders entirely (don't even create them)
         const abs = path.join(localRoot, rel) // Local path
 
         if (item.type === 'directory') {
@@ -534,84 +670,108 @@ async function downloadDir(client, remoteRel, localRoot, syncState = null) {
   }
 }
 
-// Upload function with permission checks
+// Upload a single file: decides whether to upload, performs it, and updates state.
+// Safe to run concurrently with sibling files — the shared readOnlyWarned/quota/syncState
+// objects are only mutated, and Node's single-threaded model rules out real races.
+async function uploadFile(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota, syncState) {
+  const localPath = path.join(localRoot, nextRel) // abs path
+  const localStats = await fs.stat(localPath) // Single local stat per file
+  if (syncState && localMatchesSyncSnapshot(nextRel, localStats, syncState)) {
+    return // Unchanged since last aligned sync — skip remote PROPFIND and upload
+  }
+
+  if (await shouldUpload(client, localPath, '/' + nextRel, localStats)) { // decide upload
+    const parentPosix = path.posix.dirname('/' + nextRel) // remote parent
+    if (parentPosix && parentPosix !== '/' && parentPosix !== '.') {
+      await ensureRemoteDir(client, parentPosix) // ensure parent
+    }
+
+    try {
+      const data = await fs.readFile(localPath) // read local
+      await client.putFileContents('/' + nextRel, data, { overwrite: true }) // upload
+
+      // Align local mtime to the upload moment (whole seconds) instead of
+      // doing an extra PROPFIND for the server's lastmod. The server stamps
+      // lastmod ≈ now at second resolution, so this stays inside TIMESTAMP_TOLERANCE
+      // and avoids a per-file round-trip.
+      try {
+        const alignedTime = new Date(Math.floor(Date.now() / 1000) * 1000) // now, second resolution
+        await fs.utimes(localPath, alignedTime, alignedTime) // align mtime
+      } catch {
+        console.warn(`Could not sync timestamp for ${nextRel}`) // warn
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Zeitstempel-Sync fehlgeschlagen: ${nextRel}` })
+      }
+
+      if (syncState) {
+        const st = await fs.stat(localPath) // Post-upload metadata
+        recordSyncedLocalFile(nextRel, st, syncState) // Persist fast-path fingerprint
+      }
+
+      console.log(`Uploaded: ${nextRel}`) // ok
+      win?.webContents?.send('sync-result', { status: 'info', message: `Hochgeladen: ${nextRel}` })
+    } catch (e) {
+      if (isPermissionError(e)) { // read-only share
+        const dirRel = path.posix.dirname(nextRel) || '/' // dir
+        if (!readOnlyWarned.has(dirRel)) { // warn once
+          readOnlyWarned.add(dirRel) // mark
+          win?.webContents?.send('sync-result', { status: 'warning', message: `Kein Schreibrecht in „/${dirRel}" – Uploads werden dort übersprungen` }) // notify
+        }
+        console.warn(`Skipped (read-only): ${nextRel}`) // log skip
+        win?.webContents?.send('sync-result', { status: 'warning', message: `Upload übersprungen (read-only): ${nextRel}` })
+        return // keep going with siblings
+      }
+      if (isQuotaError(e)) {
+        if (!stopUploadsDueToQuota.value) {
+          stopUploadsDueToQuota.value = true
+          console.warn('Server storage exhausted (507). Skipping remaining uploads this cycle.')
+          win?.webContents?.send('sync-result', { status: 'warning', message: 'Server-Speicher erschöpft (507) – restliche Uploads werden übersprungen' })
+        }
+        return
+      }
+      console.error(`Error uploading ${nextRel}:`, e?.message) // other error
+      win?.webContents?.send('sync-result', { status: 'warning', message: `Upload fehlgeschlagen: ${nextRel}` })
+      return // keep going with siblings
+    }
+  } else if (syncState) {
+    recordSyncedLocalFile(nextRel, localStats, syncState) // No upload needed; cache for next Sync Up
+  }
+}
+
+// Upload function with permission checks. Files within a directory are processed
+// with bounded concurrency (UPLOAD_CONCURRENCY) so per-file PROPFINDs run in parallel;
+// subdirectories are still walked sequentially to avoid opening the whole tree at once.
 async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), stopUploadsDueToQuota = { value: false }, syncState = null) {
   try {
     const absDir = path.join(localRoot, rel) // local dir
     const entries = await fs.readdir(absDir, { withFileTypes: true }) // list
 
+    const fileRels = [] // Files in this directory, processed in parallel below
+    const dirRels = [] // Subdirectories, recursed sequentially after files
+
     for (const e of entries) {
+      if (shouldExcludePath(e.name)) continue // skip excluded files
+      const nextRel = path.posix.join(rel, e.name) // POSIX rel
+      if (isDeselectedTopDir(nextRel, e.isDirectory()) || !isPathInSelection(nextRel)) continue // skip deselected top folders entirely
+      if (e.isDirectory()) dirRels.push(nextRel)
+      else fileRels.push(nextRel)
+    }
+
+    await runWithConcurrency(fileRels, UPLOAD_CONCURRENCY, async (nextRel) => {
+      if (stopUploadsDueToQuota.value) return // short-circuit uploads for this cycle
       try {
-        if (stopUploadsDueToQuota.value) { // short-circuit uploads for this cycle
-          break
-        }
-        if (shouldExcludePath(e.name)) continue // skip excluded files
-        const nextRel = path.posix.join(rel, e.name) // POSIX rel
-
-        if (e.isDirectory()) {
-          await uploadDir(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota, syncState) // recurse
-        } else {
-          const localPath = path.join(localRoot, nextRel) // abs path
-          const localStats = await fs.stat(localPath) // Single local stat per file
-          if (syncState && localMatchesSyncSnapshot(nextRel, localStats, syncState)) {
-            continue // Unchanged since last aligned sync — skip remote PROPFIND and upload
-          }
-
-          if (await shouldUpload(client, localPath, '/' + nextRel, localStats)) { // decide upload
-            const parentPosix = path.posix.dirname('/' + nextRel) // remote parent
-            if (parentPosix && parentPosix !== '/' && parentPosix !== '.') {
-              await ensureRemoteDir(client, parentPosix) // ensure parent
-            }
-
-            try {
-              const data = await fs.readFile(localPath) // read local
-              await client.putFileContents('/' + nextRel, data, { overwrite: true }) // upload
-
-              try {
-                const remoteStats = await client.stat('/' + nextRel) // remote stat
-                const remoteTime = new Date(remoteStats.lastmod) // mtime
-                await fs.utimes(localPath, remoteTime, remoteTime) // align mtime
-              } catch { 
-                console.warn(`Could not sync timestamp for ${nextRel}`) // warn
-                win?.webContents?.send('sync-result', { status: 'warning', message: `Zeitstempel-Sync fehlgeschlagen: ${nextRel}` })
-              }
-
-              if (syncState) {
-                const st = await fs.stat(localPath) // Post-upload metadata
-                recordSyncedLocalFile(nextRel, st, syncState) // Persist fast-path fingerprint
-              }
-
-              console.log(`Uploaded: ${nextRel}`) // ok
-              win?.webContents?.send('sync-result', { status: 'info', message: `Hochgeladen: ${nextRel}` })
-            } catch (e) {
-              if (isPermissionError(e)) { // read-only share
-                const dirRel = path.posix.dirname(nextRel) || '/' // dir
-                if (!readOnlyWarned.has(dirRel)) { // warn once
-                  readOnlyWarned.add(dirRel) // mark
-                  win?.webContents?.send('sync-result', { status: 'warning', message: `Kein Schreibrecht in „/${dirRel}" – Uploads werden dort übersprungen` }) // notify
-                }
-                console.warn(`Skipped (read-only): ${nextRel}`) // log skip
-                win?.webContents?.send('sync-result', { status: 'warning', message: `Upload übersprungen (read-only): ${nextRel}` })
-                continue // keep loop
-              }
-              if (isQuotaError(e)) {
-                if (!stopUploadsDueToQuota.value) {
-                  stopUploadsDueToQuota.value = true
-                  console.warn('Server storage exhausted (507). Skipping remaining uploads this cycle.')
-                  win?.webContents?.send('sync-result', { status: 'warning', message: 'Server-Speicher erschöpft (507) – restliche Uploads werden übersprungen' })
-                }
-                continue
-              }
-              console.error(`Error uploading ${nextRel}:`, e?.message) // other error
-              win?.webContents?.send('sync-result', { status: 'warning', message: `Upload fehlgeschlagen: ${nextRel}` })
-              continue // keep loop
-            }
-          } else if (syncState) {
-            recordSyncedLocalFile(nextRel, localStats, syncState) // No upload needed; cache for next Sync Up
-          }
-        }
+        await uploadFile(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota, syncState)
       } catch (e) {
-        console.error(`Error processing ${e.name}:`, e?.message) // per-entry error
+        console.error(`Error processing ${nextRel}:`, e?.message) // per-entry error
+      }
+    })
+
+    for (const nextRel of dirRels) {
+      if (stopUploadsDueToQuota.value) break // short-circuit uploads for this cycle
+      try {
+        await uploadDir(client, localRoot, nextRel, readOnlyWarned, stopUploadsDueToQuota, syncState) // recurse
+      } catch (e) {
+        if (!isNetworkError(e)) console.error(`Error processing ${nextRel}:`, e?.message) // per-entry error
+        else throw e // bubble network errors to adjust backoff
       }
     }
   } catch (e) {
