@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "electron .",
-    "build": "electron-builder",
-    "build:mac:arm64": "electron-builder --mac dmg --arm64"
+    "build": "electron-builder --publish never",
+    "build:mac:arm64": "electron-builder --mac dmg --arm64 --publish never"
   },
   "author": {
     "name": "valueerror",
