@@ -18,7 +18,6 @@ let isConnected = false // Connection status
 
 const TIMESTAMP_TOLERANCE = 5000 // 5s tolerance
 const UPLOAD_CONCURRENCY = 12 // Max parallel per-file WebDAV operations during Sync Up
-const APP_VERSION = '1.0.4' // Application version
 
 // Run async tasks with a bounded concurrency limit, preserving no particular order.
 async function runWithConcurrency(items, limit, worker) {
@@ -207,7 +206,7 @@ ipcMain.handle('logout', async () => {
 })
 
 ipcMain.handle('get-version', async () => {
-  return { version: APP_VERSION } // Return app version
+  return { version: app.getVersion() } // Return version from package.json
 })
 
 // New sync handlers
@@ -256,19 +255,52 @@ ipcMain.handle('list-top-folders', async () => {
       folders.push({ name, size }) // size may be null if server didn't report it
     }
     folders.sort((a, b) => (b.size ?? 0) - (a.size ?? 0)) // Biggest first
-    return { status: 'ok', folders, selected: selectedTopFolders ? [...selectedTopFolders] : null }
+    return {
+      status: 'ok',
+      folders,
+      selected: selectedPaths ? [...selectedPaths] : null, // Saved selected paths (any depth); null = all
+    }
   } catch (e) {
     console.error('list-top-folders failed:', e?.message)
     return { status: 'error', message: e?.message }
   }
 })
 
+// List the immediate sub-folders of a given top-level folder (lazy, on expand).
+// Same instant single Depth:1 PROPFIND as list-top-folders, scoped to one path.
+ipcMain.handle('list-subfolders', async (_event, { path: relPath }) => {
+  if (!client) return { status: 'no-client' } // Guard
+  const clean = String(relPath || '').replace(/^\/+|\/+$/g, '') // Normalize POSIX rel path
+  if (!clean) return { status: 'error', message: 'Kein Pfad angegeben' }
+  try {
+    const list = await client.getDirectoryContents('/' + clean, { details: true }) // Raw props per entry
+    const items = list.data ?? list // details:true wraps results in { data }
+    const folders = []
+    for (const item of items) {
+      if (item.type !== 'directory') continue // sub-folders only
+      const name = item.basename || item.filename.replace(/^\/+|\/+$/g, '').split('/').pop()
+      if (!name || shouldExcludePath(name)) continue // skip excluded
+      const childPath = clean + '/' + name // Full POSIX path used for selection
+      const props = item.props || {}
+      const rawSize = Number(props['quota-used-bytes']) // Nextcloud: recursive bytes used by this folder
+      const size = Number.isFinite(rawSize) && rawSize >= 0 ? rawSize : null // negatives = unknown
+      folders.push({ name, path: childPath, size })
+    }
+    folders.sort((a, b) => (b.size ?? 0) - (a.size ?? 0)) // Biggest first
+    return { status: 'ok', folders }
+  } catch (e) {
+    console.error('list-subfolders failed:', e?.message)
+    return { status: 'error', message: e?.message }
+  }
+})
+
 // Persist the user's folder selection, then run the initial sync down for the chosen scope.
-// folders === null (or empty array meaning "all") clears the filter and syncs everything.
-ipcMain.handle('set-selected-folders', async (_event, { folders }) => {
+// paths === null (or empty array meaning "all") clears the filter and syncs everything.
+// paths = selected folder paths at any depth; each syncs everything beneath it.
+ipcMain.handle('set-selected-folders', async (_event, { paths }) => {
   if (!client) return { status: 'no-client' } // Guard
   try {
-    await saveSelectedTopFolders(Array.isArray(folders) ? folders : null) // Update + persist
+    await saveSelectedTopFolders(Array.isArray(paths) ? paths : null) // Update + persist
     setImmediate(async () => {
       try {
         await performInitialSyncDown()
@@ -449,7 +481,7 @@ async function collectLocalFiles(localRoot, rel, files) {
       if (shouldExcludePath(entry.name)) continue
 
       const nextRel = path.posix.join(rel, entry.name)
-      if (isDeselectedTopDir(nextRel, entry.isDirectory()) || !isPathInSelection(nextRel)) continue // ignore deselected top folders
+      if (shouldSkipEntry(nextRel, entry.isDirectory())) continue // ignore folders outside the selection
       if (entry.isDirectory()) {
         await collectLocalFiles(localRoot, nextRel, files)
       } else {
@@ -468,7 +500,7 @@ async function collectRemoteFiles(client, rel, files) {
     for (const item of list) {
       const relPath = item.filename.replace(/^\//, '')
       if (shouldExcludePath(relPath)) continue
-      if (isDeselectedTopDir(relPath, item.type === 'directory') || !isPathInSelection(relPath)) continue // ignore deselected top folders (never flag for deletion)
+      if (shouldSkipEntry(relPath, item.type === 'directory')) continue // ignore folders outside the selection (never flag for deletion)
 
       if (item.type === 'directory') {
         await collectRemoteFiles(client, relPath, files)
@@ -525,8 +557,11 @@ async function saveSyncState(state) {
   await fs.writeFile(syncStateFilePath(), payload, 'utf8') // Persist
 }
 
-// ---------- Top-level folder selection ----------
-// When enabled, only the selected first-level folders are synced (down + up + delete check).
+// ---------- Folder selection (independent path selection, any depth) ----------
+// When enabled, only selected folder paths are synced (down + up + delete check).
+// A selected path syncs everything beneath it. A path may be selected without its parent —
+// the parent is then only a "pass-through" directory: created/traversed, but its own files
+// are not synced unless the parent itself is selected too.
 // Stored locally; an empty/missing selection means "sync everything" (no filtering).
 const SYNC_FOLDERS_FILE = '.sync-folders.json' // Local selection store (excluded from WebDAV sync)
 
@@ -535,58 +570,89 @@ function syncFoldersFilePath() {
 }
 
 // In-memory selection for the current session. null = no filter (sync all).
-// A Set of top-level folder names means: only sync these folders (plus root-level files).
-let selectedTopFolders = null
+// A Set of POSIX paths (any depth, e.g. "Documents" or "Documents/Rechnungen").
+let selectedPaths = null
 
 async function loadSelectedTopFolders() {
   try {
     const raw = await fs.readFile(syncFoldersFilePath(), 'utf8') // Read JSON
     const data = JSON.parse(raw) // Parse
+    // v3: { paths: [...] } independent path selection.
+    if (data && Array.isArray(data.paths)) {
+      selectedPaths = data.paths.length ? new Set(data.paths) : null
+      return selectedPaths
+    }
+    // Back-compat: v1/v2 stored top-level folders in "folders" (+ optional "excluded").
+    // Migrate by treating selected top folders as selected paths; drop excluded sub-paths
+    // (their absence from the new set means "not synced", matching old behavior closely enough).
     if (data && Array.isArray(data.folders)) {
-      selectedTopFolders = new Set(data.folders) // Apply filter
-      return selectedTopFolders
+      const excluded = new Set(Array.isArray(data.excluded) ? data.excluded : [])
+      const paths = data.folders.filter((f) => !excluded.has(f))
+      selectedPaths = paths.length ? new Set(paths) : null
+      return selectedPaths
     }
   } catch {
     // Missing or corrupt → no filter
   }
-  selectedTopFolders = null // Sync everything
+  selectedPaths = null // Sync everything
   return null
 }
 
-async function saveSelectedTopFolders(folders) {
-  selectedTopFolders = Array.isArray(folders) ? new Set(folders) : null // Update in-memory
-  if (selectedTopFolders === null) {
+async function saveSelectedTopFolders(paths) {
+  selectedPaths = Array.isArray(paths) && paths.length ? new Set(paths) : null // Update in-memory
+  if (selectedPaths === null) {
     try { await fs.unlink(syncFoldersFilePath()) } catch { /* nothing to remove */ }
     return
   }
-  const payload = JSON.stringify({ v: 1, folders: [...selectedTopFolders] }, null, 0) // Compact JSON
+  const payload = JSON.stringify({ v: 3, paths: [...selectedPaths] }, null, 0) // Compact JSON
   await fs.writeFile(syncFoldersFilePath(), payload, 'utf8') // Persist
 }
 
-// Returns the top-level folder name for a POSIX-relative path, or '' for root-level files.
-function topFolderOf(relPosix) {
-  const clean = relPosix.replace(/^\/+/, '') // Strip leading slashes
-  const slash = clean.indexOf('/')
-  return slash === -1 ? '' : clean.slice(0, slash) // First path segment when nested
+// Normalize a relative POSIX path (strip surrounding slashes).
+function cleanRel(relPosix) {
+  return relPosix.replace(/^\/+|\/+$/g, '')
 }
 
-// Decide whether a given relative path is in scope of the current folder selection.
-// Root-level files (no folder) are always in scope; only top-level folders are filterable.
-function isPathInSelection(relPosix) {
-  if (!selectedTopFolders) return true // No filter active → everything in scope
-  const top = topFolderOf(relPosix)
-  if (top === '') return true // Root-level file/dir entry stays in scope
-  return selectedTopFolders.has(top) // Only selected top folders
+// True when relPosix is the same as, or a descendant of, any selected path.
+// Such a path is fully in scope (its own files sync).
+function isUnderSelected(clean) {
+  if (!selectedPaths) return false
+  if (selectedPaths.has(clean)) return true // Exactly selected
+  for (const sel of selectedPaths) {
+    if (clean.startsWith(sel + '/')) return true // Under a selected ancestor
+  }
+  return false
 }
 
-// True when relPosix is a top-level *directory* entry (no slash) that was NOT selected,
-// so the directory itself must be skipped entirely (not even created locally).
-// isDir guards against treating a root-level file as a folder.
-function isDeselectedTopDir(relPosix, isDir) {
-  if (!selectedTopFolders || !isDir) return false // No filter, or not a directory
-  const clean = relPosix.replace(/^\/+|\/+$/g, '') // Strip surrounding slashes
-  if (!clean || clean.includes('/')) return false // Not a top-level entry
-  return !selectedTopFolders.has(clean) // Top-level dir not in selection
+// True when relPosix is a strict ancestor of some selected path (a pass-through directory
+// that must be created/traversed to reach a deeper selection, but isn't itself selected).
+function isAncestorOfSelected(clean) {
+  if (!selectedPaths) return false
+  for (const sel of selectedPaths) {
+    if (sel.startsWith(clean + '/')) return true // clean is an ancestor of sel
+  }
+  return false
+}
+
+// Single skip decision for a directory entry (file or folder) during a sync walk.
+// Returns true when the entry must be skipped entirely. Honors the independent path model:
+//   - no filter            → never skip
+//   - root-level file       → always kept (top-level loose files stay in sync)
+//   - file (nested)         → skip unless under a selected path
+//   - directory             → skip unless under a selection OR an ancestor of one (pass-through)
+// A pass-through directory is traversed/created but contributes no files of its own; files
+// directly inside it are nested files and get skipped by the file rule above.
+function shouldSkipEntry(relPosix, isDir) {
+  if (!selectedPaths) return false // No filter active → keep everything
+  const clean = cleanRel(relPosix)
+  if (!clean) return false // Root itself
+  if (!isDir) {
+    if (!clean.includes('/')) return false // Root-level loose file → keep
+    return !isUnderSelected(clean) // Nested file kept only under a selection
+  }
+  if (isUnderSelected(clean)) return false // Directory in scope
+  if (isAncestorOfSelected(clean)) return false // Pass-through to a deeper selection
+  return true // Directory outside every selected subtree → skip
 }
 
 function recordSyncedLocalFile(relPosix, stats, state) {
@@ -632,7 +698,7 @@ async function downloadDir(client, remoteRel, localRoot, syncState = null) {
       try {
         const rel = item.filename.replace(/^\//,'') // Normalize
         if (shouldExcludePath(rel)) continue // Skip excluded files and patterns
-        if (isDeselectedTopDir(rel, item.type === 'directory') || !isPathInSelection(rel)) continue // Skip deselected top folders entirely (don't even create them)
+        if (shouldSkipEntry(rel, item.type === 'directory')) continue // Skip folders outside the selection entirely (don't even create them)
         const abs = path.join(localRoot, rel) // Local path
 
         if (item.type === 'directory') {
@@ -751,7 +817,7 @@ async function uploadDir(client, localRoot, rel, readOnlyWarned = new Set(), sto
     for (const e of entries) {
       if (shouldExcludePath(e.name)) continue // skip excluded files
       const nextRel = path.posix.join(rel, e.name) // POSIX rel
-      if (isDeselectedTopDir(nextRel, e.isDirectory()) || !isPathInSelection(nextRel)) continue // skip deselected top folders entirely
+      if (shouldSkipEntry(nextRel, e.isDirectory())) continue // skip folders outside the selection entirely
       if (e.isDirectory()) dirRels.push(nextRel)
       else fileRels.push(nextRel)
     }

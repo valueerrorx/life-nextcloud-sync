@@ -49,7 +49,11 @@
 
     <!-- Sync Buttons (hidden initially) -->
     <div id="syncButtons" class="card shadow p-4 mb-3" style="width: 320px; display: none;">
-        <h5 class="text-center mb-3">Sync-Optionen</h5>
+        <div class="d-flex justify-content-between align-items-center mb-3">
+            <h5 class="mb-0">Sync-Optionen</h5>
+            <span class="badge bg-success rounded-pill">verbunden</span>
+        </div>
+        <p id="connectedAs" class="text-muted small text-center mb-3 text-truncate"></p>
         <div class="d-grid gap-2">
             <button id="syncDownBtn" class="btn btn-success" onclick="syncDown()">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="me-2">
@@ -67,6 +71,10 @@
                 📁 Ordner verwalten
             </button>
         </div>
+        <hr class="my-3">
+        <button id="logoutBtn" class="btn btn-outline-danger btn-sm w-100" onclick="logout()">
+            Abmelden
+        </button>
     </div>
   
     <!-- fixed-height status div -->
@@ -119,7 +127,7 @@
             <button type="button" class="btn-close" onclick="closeFolderOverlay()"></button>
           </div>
           <div class="px-3 pt-3">
-            <p class="text-muted small mb-2">Nur ausgewählte Ordner werden synchronisiert.</p>
+            <p class="text-muted small mb-2">Nur angehakte Ordner werden synchronisiert. Pfeil zum Aufklappen. Ein Unterordner kann auch ohne seinen übergeordneten Ordner gewählt werden.</p>
             <div class="d-flex justify-content-between mb-2">
               <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setAllFolders(true)">Alle</button>
               <button type="button" class="btn btn-outline-secondary btn-sm" onclick="setAllFolders(false)">Keine</button>
@@ -369,6 +377,25 @@
             return `${n.toFixed(n < 10 && i > 0 ? 1 : 0)} ${units[i]}`
         }
 
+        // ----- Folder tree state (independent path selection, any depth) -----
+        // node: { path, name, size, depth, checked, expanded, loaded, children:[...] }
+        // checked === true means "sync this path" (everything beneath it). A child may be checked
+        // without its parent — the parent is then a pass-through only. No cascading: each checkbox
+        // selects exactly its own path. savedSelected holds persisted selected paths (null = all).
+        let folderTree = []
+        let savedSelected = null   // null = everything selected by default
+
+        // Escape a value for safe use inside an HTML attribute.
+        function attr(v) { return String(v).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;") }
+
+        // Initial checked state for a path: selected if it (or an ancestor) is in the saved set.
+        // null saved set = nothing chosen yet → default everything to checked (sync all).
+        function initialChecked(p) {
+            if (savedSelected === null) return true
+            if (savedSelected.includes(p)) return true
+            return savedSelected.some((sel) => p.startsWith(sel + "/")) // under a saved ancestor
+        }
+
         function loadTopFolders() {
             const listEl = document.getElementById("folderList")
             const applyBtn = document.getElementById("applyFoldersBtn")
@@ -376,54 +403,153 @@
             listEl.innerHTML = '<div class="text-muted text-center py-3"><span class="spinner-border spinner-border-sm me-2"></span>Ordner werden geladen...</div>'
             applyBtn.disabled = true
             applyBtn.textContent = "Auswahl übernehmen & synchronisieren"
+            folderTree = []
             ipcRenderer.invoke("list-top-folders").then((result) => {
                 if (result.status !== "ok") {
                     listEl.innerHTML = `<div class="alert alert-danger">Ordner konnten nicht geladen werden: ${result.message || ""}</div>`
                     return
                 }
+                savedSelected = result.selected // null = all, else array of selected paths
                 if (!result.folders.length) {
                     listEl.innerHTML = `<div class="text-muted text-center py-3">Keine Ordner gefunden.</div>`
                     applyBtn.disabled = false
                     return
                 }
-                // Previously saved selection (null = all selected by default)
-                const saved = result.selected
-                const html = result.folders.map((f, idx) => {
-                    const checked = (saved === null || saved.includes(f.name)) ? "checked" : ""
-                    const size = formatSize(f.size)
-                    return `
-                        <div class="form-check d-flex justify-content-between align-items-center py-1">
-                            <span>
-                                <input type="checkbox" class="form-check-input folder-cb" id="fcb_${idx}" value="${f.name.replace(/"/g, "&quot;")}" ${checked}>
-                                <label class="form-check-label ms-1" for="fcb_${idx}">${f.name}</label>
-                            </span>
-                            <span class="text-muted small">${size}</span>
-                        </div>
-                    `
-                }).join("")
-                listEl.innerHTML = html
+                folderTree = result.folders.map((f) => ({
+                    path: f.name, name: f.name, size: f.size, depth: 0,
+                    checked: initialChecked(f.name),
+                    expanded: false, loaded: false, children: [],
+                }))
+                renderFolderTree()
                 applyBtn.disabled = false
             })
         }
 
+        // Flatten the tree (respecting expanded state) into rendered rows.
+        function renderFolderTree() {
+            const listEl = document.getElementById("folderList")
+            const rows = []
+            const walk = (nodes) => {
+                for (const n of nodes) {
+                    rows.push(folderRowHtml(n))
+                    if (n.expanded && n.children.length) walk(n.children)
+                }
+            }
+            walk(folderTree)
+            listEl.innerHTML = rows.join("") || `<div class="text-muted text-center py-3">Keine Ordner gefunden.</div>`
+        }
+
+        function folderRowHtml(n) {
+            const pad = 8 + n.depth * 20 // indent per level
+            const size = formatSize(n.size)
+            const caret = `<span class="folder-caret" style="display:inline-block;width:16px;cursor:pointer;user-select:none;text-align:center" onclick="toggleFolder('${attr(n.path)}')">${n.expanded ? "▾" : "▸"}</span>`
+            const id = "fcb_" + n.path.replace(/[^a-zA-Z0-9]/g, "_")
+            return `
+                <div class="d-flex justify-content-between align-items-center py-1" style="padding-left:${pad}px">
+                    <span class="d-flex align-items-center" style="min-width:0">
+                        ${caret}
+                        <input type="checkbox" class="form-check-input folder-cb ms-1" id="${id}" data-path="${attr(n.path)}" ${n.checked ? "checked" : ""} onchange="onFolderToggle('${attr(n.path)}', this.checked)">
+                        <label class="form-check-label ms-2 text-truncate" for="${id}" style="cursor:pointer">${attr(n.name)}</label>
+                    </span>
+                    <span class="text-muted small ms-2 flex-shrink-0">${size}</span>
+                </div>
+            `
+        }
+
+        // Find a node by its full path anywhere in the tree.
+        function findNode(nodes, p) {
+            for (const n of nodes) {
+                if (n.path === p) return n
+                if (n.children.length) { const hit = findNode(n.children, p); if (hit) return hit }
+            }
+            return null
+        }
+
+        function toggleFolder(p) {
+            const node = findNode(folderTree, p)
+            if (!node) return
+            if (node.expanded) { node.expanded = false; renderFolderTree(); return }
+            if (node.loaded) { node.expanded = true; renderFolderTree(); return }
+            // Lazy load children
+            node.expanded = true
+            node.loaded = true
+            renderFolderTree()
+            ipcRenderer.invoke("list-subfolders", { path: node.path }).then((result) => {
+                if (result.status !== "ok") {
+                    node.children = []
+                    renderFolderTree()
+                    return
+                }
+                node.children = result.folders.map((f) => ({
+                    path: f.path, name: f.name, size: f.size, depth: node.depth + 1,
+                    // Inherit the parent's checked state when it (or an ancestor) is selected,
+                    // otherwise fall back to the saved selection for this exact child path.
+                    checked: node.checked || initialChecked(f.path),
+                    expanded: false, loaded: false, children: [],
+                }))
+                renderFolderTree()
+            })
+        }
+
+        // Independent selection: flipping a checkbox affects only that path. No cascading —
+        // a child stays selectable without its parent, and a parent selects its whole subtree implicitly.
+        function onFolderToggle(p, checked) {
+            const node = findNode(folderTree, p)
+            if (!node) return
+            node.checked = checked
+            // If a parent is turned off but a loaded child was relying on inheritance, keep the child's
+            // own explicit state untouched — nothing to cascade. Re-render to refresh the view.
+            renderFolderTree()
+        }
+
         function setAllFolders(state) {
-            document.querySelectorAll(".folder-cb").forEach(cb => cb.checked = state)
+            const walk = (nodes) => nodes.forEach((n) => { n.checked = state; if (n.children.length) walk(n.children) })
+            walk(folderTree)
+            renderFolderTree()
+        }
+
+        // Collect selected paths, dropping any that are redundant because an ancestor is also selected.
+        // Includes checked nodes from the visible/loaded tree plus saved selections under collapsed,
+        // un-expanded branches so untouched deep selections are preserved.
+        function collectSelection() {
+            const chosen = new Set()
+            const walk = (nodes) => {
+                for (const n of nodes) {
+                    if (n.checked) chosen.add(n.path)
+                    if (n.children.length) walk(n.children)
+                }
+            }
+            walk(folderTree)
+            // Preserve saved selections whose branch was never expanded this session, unless their
+            // top-level ancestor was explicitly unchecked.
+            if (savedSelected) {
+                for (const sel of savedSelected) {
+                    const top = sel.split("/")[0]
+                    const topNode = findNode(folderTree, top)
+                    // Keep if the top node is gone (different listing) or still checked/never expanded.
+                    if (!topNode) { chosen.add(sel); continue }
+                    if (topNode.checked) continue // covered by the ancestor already
+                    if (!topNode.loaded && sel !== top) chosen.add(sel) // deep selection under an un-expanded, unchecked top
+                }
+            }
+            // Drop entries that are descendants of another chosen path (ancestor already covers them).
+            const arr = [...chosen]
+            const minimal = arr.filter((p) => !arr.some((other) => other !== p && p.startsWith(other + "/")))
+            return minimal
         }
 
         function applyFolderSelection() {
-            const folders = Array.from(document.querySelectorAll(".folder-cb"))
-                .filter(cb => cb.checked)
-                .map(cb => cb.value)
+            const paths = collectSelection()
 
             const btn = document.getElementById("applyFoldersBtn")
             btn.disabled = true
             btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Synchronisiere...'
 
-            ipcRenderer.invoke("set-selected-folders", { folders }).then((result) => {
+            ipcRenderer.invoke("set-selected-folders", { paths }).then((result) => {
                 if (result.status === "ok") {
                     closeFolderOverlay()
                     document.getElementById("syncButtons").style.display = "block"
-                    statusHistory.add(`Ordnerauswahl gespeichert (${folders.length}) – Sync startet`, "info")
+                    statusHistory.add(`Ordnerauswahl gespeichert (${paths.length} Pfad${paths.length === 1 ? "" : "e"}) – Sync startet`, "info")
                 } else {
                     statusHistory.add(`Ordnerauswahl fehlgeschlagen: ${result.message || ""}`, "error")
                 }
