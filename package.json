@@ -9,7 +9,11 @@
     "build": "electron-builder",
     "build:mac:arm64": "electron-builder --mac dmg --arm64"
   },
-  "author": "valueerror",
+  "author": {
+    "name": "valueerror",
+    "email": "valueerrorx@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/valueerrorx/life-nextcloud-sync",
   "license": "ISC",
   "build": {
     "appId": "eu.life-edu.lifenextcloudsync",

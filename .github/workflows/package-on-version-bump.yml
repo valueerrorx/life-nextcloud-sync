@@ -1,4 +1,4 @@
-# Builds AppImage + deb (Linux), portable exe + MSI (Windows), DMG (macOS) and publishes one GitHub Release when package.json "version" changes on main.
+# Builds AppImage + deb (Linux) and publishes a GitHub Release when package.json "version" changes on main.
 name: Package on version bump
 
 on:
@@ -83,83 +83,8 @@ jobs:
             dist/*.AppImage
             dist/*.deb
 
-  build-windows:
-    needs: check-version
-    if: needs.check-version.outputs.build == 'true'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Decode code signing certificate
-        env:
-          P12_BASE64: ${{ secrets.P12_BASE64 }}
-        run: |
-          if (-not $env:P12_BASE64) { exit 0 }
-          [System.IO.File]::WriteAllBytes('./certificate.p12', [System.Convert]::FromBase64String($env:P12_BASE64))
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-        env:
-          ELECTRON_BUILDER_PUBLISH: never
-          CSC_LINK: ${{ secrets.P12_BASE64 && 'file://./certificate.p12' || '' }}
-          CSC_KEY_PASSWORD: ${{ secrets.P12_PASSWORD }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-dist
-          if-no-files-found: error
-          path: |
-            dist/*.exe
-            dist/*.msi
-
-  build-mac:
-    needs: check-version
-    if: needs.check-version.outputs.build == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Decode .p12 file
-        env:
-          P12_BASE64_APPLE: ${{ secrets.P12_BASE64_APPLE }}
-        run: |
-          if [ -z "$P12_BASE64_APPLE" ]; then exit 0; fi
-          echo "$P12_BASE64_APPLE" | base64 -d > ./certificate.p12
-      - name: Import signing certificate
-        env:
-          CSC_KEY_PASSWORD: ${{ secrets.P12_PASSWORD_APPLE }}
-          P12_BASE64_APPLE: ${{ secrets.P12_BASE64_APPLE }}
-        run: |
-          if [ -z "$P12_BASE64_APPLE" ]; then exit 0; fi
-          security create-keychain -p "" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "" build.keychain
-          security import ./certificate.p12 -k ~/Library/Keychains/build.keychain -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: npm
-      - run: npm ci
-      - name: Build signed macOS arm64 DMG
-        run: npm run build:mac:arm64
-        env:
-          CSC_LINK: ${{ secrets.P12_BASE64_APPLE && 'file://./certificate.p12' || '' }}
-          CSC_KEY_PASSWORD: ${{ secrets.P12_PASSWORD_APPLE }}
-          APPLE_ID: ${{ secrets.APPLEID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLEIDPASS }}
-          APPLE_TEAM_ID: ${{ secrets.TEAMID }}
-          USE_HARD_LINKS: "false"
-          ELECTRON_BUILDER_DISABLE_LINKS: "true"
-          ELECTRON_BUILDER_PUBLISH: never
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mac-dist
-          if-no-files-found: error
-          path: dist/*.dmg
-
   release:
-    needs: [check-version, build-linux, build-windows, build-mac]
+    needs: [check-version, build-linux]
     if: needs.check-version.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -192,14 +117,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: linux-dist
-          path: release-assets
-      - uses: actions/download-artifact@v4
-        with:
-          name: windows-dist
-          path: release-assets
-      - uses: actions/download-artifact@v4
-        with:
-          name: mac-dist
           path: release-assets
       - name: Create GitHub release
         env:
