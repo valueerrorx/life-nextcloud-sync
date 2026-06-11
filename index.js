@@ -127,9 +127,25 @@ function createWindow() {
   //win.webContents.openDevTools(); // Show dev tools
 
   win.on('close', (event) => {
-    if (!app.isQuiting) { event.preventDefault(); win.hide() } // Minimize to tray
+    if (!app.isQuiting) {
+      event.preventDefault() // Don't actually close
+      win.hide() // Minimize to tray
+      if (!trayHintShown) { // Show the tray hint once per app run
+        trayHintShown = true
+        dialog.showMessageBox({
+          type: 'info',
+          title: 'LiFE Nextcloud Sync',
+          message: 'Im Hintergrund aktiv',
+          detail: 'Der Nextcloud Sync Client läuft weiter im Systemtray. Über das Tray-Symbol kannst du das Fenster wiederherstellen oder die App beenden.',
+          buttons: ['OK'],
+        }).catch(() => {}) // Non-blocking; ignore dialog errors
+      }
+    }
   })
 }
+
+// True once the "minimized to tray" hint has been shown this app run (shown once per start).
+let trayHintShown = false
 
 function createTray() {
   tray = new Tray(path.join(__dirname, 'trayicon.png')) // Create tray icon
