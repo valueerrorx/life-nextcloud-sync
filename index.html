@@ -8,7 +8,29 @@
       body {
         background-color: #0082c9; /* Nextcloud light blue */
       }
-
+      .folder-cb-indet {
+        display: inline-block;
+        width: 1em;
+        height: 1em;
+        border-radius: 0.25em;
+        border: 1px solid #0d6efd;
+        background-color: #0d6efd;
+        cursor: pointer;
+        vertical-align: middle;
+        position: relative;
+        flex-shrink: 0;
+      }
+      .folder-cb-indet::before {
+        content: '';
+        position: absolute;
+        top: 50%;
+        left: 15%;
+        right: 15%;
+        height: 2px;
+        background: white;
+        transform: translateY(-50%);
+        border-radius: 1px;
+      }
     </style>
   </head>
   
@@ -449,7 +471,6 @@
             }
             walk(folderTree)
             listEl.innerHTML = rows.join("") || `<div class="text-muted text-center py-3">Keine Ordner gefunden.</div>`
-            setIndeterminateStates()
         }
 
         function folderRowHtml(n) {
@@ -457,12 +478,16 @@
             const size = formatSize(n.size)
             const caret = `<span class="folder-caret" style="display:inline-block;width:16px;cursor:pointer;user-select:none;text-align:center" onclick="toggleFolder('${attr(n.path)}')">${n.expanded ? "▾" : "▸"}</span>`
             const id = "fcb_" + n.path.replace(/[^a-zA-Z0-9]/g, "_")
+            const indet = nodeIsIndeterminate(n)
+            const cbHtml = indet
+                ? `<span class="folder-cb-indet ms-1" title="Teilweise ausgewählt" onclick="onFolderToggle('${attr(n.path)}', true)"></span>`
+                : `<input type="checkbox" class="form-check-input folder-cb ms-1" id="${id}" data-path="${attr(n.path)}" ${n.checked ? "checked" : ""} onchange="onFolderToggle('${attr(n.path)}', this.checked)">`
             return `
                 <div class="d-flex justify-content-between align-items-center py-1" style="padding-left:${pad}px">
                     <span class="d-flex align-items-center" style="min-width:0">
                         ${caret}
-                        <input type="checkbox" class="form-check-input folder-cb ms-1" id="${id}" data-path="${attr(n.path)}" ${n.checked ? "checked" : ""} onchange="onFolderToggle('${attr(n.path)}', this.checked)">
-                        <label class="form-check-label ms-2 text-truncate" for="${id}" style="cursor:pointer">${attr(n.name)}</label>
+                        ${cbHtml}
+                        <label class="form-check-label ms-2 text-truncate" for="${indet ? '' : id}" style="cursor:pointer">${attr(n.name)}</label>
                     </span>
                     <span class="text-muted small ms-2 flex-shrink-0">${size}</span>
                 </div>
@@ -528,19 +553,6 @@
             return someOn && !allOn
         }
 
-        function setIndeterminateStates() {
-            const walk = (nodes) => {
-                for (const n of nodes) {
-                    if (n.children.length) {
-                        walk(n.children)
-                        const id = "fcb_" + n.path.replace(/[^a-zA-Z0-9]/g, "_")
-                        const el = document.getElementById(id)
-                        if (el) el.indeterminate = nodeIsIndeterminate(n)
-                    }
-                }
-            }
-            walk(folderTree)
-        }
 
         function onFolderToggle(p, checked) {
             const node = findNode(folderTree, p)
