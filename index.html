@@ -323,30 +323,30 @@
         }
 
 
+        // Remembered for the "connected as" line and a clean logout reset.
+        let connectedInfo = { server: "", username: "" }
+
         function connect(){
             const server   = document.getElementById("server").value
             const username = document.getElementById("username").value
             const password = document.getElementById("password").value
             const selectFolders = document.getElementById("selectFolders").checked
 
+            connectedInfo = { server, username }
+
             ipcRenderer.invoke("login", { server, username, password, selectFolders }).then((answer) => {
                 console.log("Backend Response:", answer)
             })
         }
         ipcRenderer.on("login-result", (event, result) => {
-            const btn = document.querySelector("#loginForm button")
-
             if (result.status === "ok") {
                 statusHistory.add(result.message, "success")
-                document.querySelectorAll("#loginForm input, #loginForm .form-check-input").forEach(el => el.disabled = true)
 
-                // change button look
-                btn.textContent = "Verbunden"
-                btn.classList.remove("btn-primary")
-                btn.classList.add("btn-success")
-                btn.disabled = true
-
-                // Sync buttons (incl. "Ordner verwalten") are always available once connected
+                // Hide the whole login card — it's inert once connected — and show the sync panel.
+                document.getElementById("loginForm").style.display = "none"
+                const host = connectedInfo.server.replace(/^https?:\/\//, "").replace(/\/+$/, "")
+                document.getElementById("connectedAs").textContent =
+                    connectedInfo.username ? `${connectedInfo.username} @ ${host}` : host
                 document.getElementById("syncButtons").style.display = "block"
 
                 if (result.mode === "select-folders") {
@@ -358,6 +358,18 @@
                 statusHistory.add(result.message, "error")
             }
         })
+
+        function logout(){
+            ipcRenderer.invoke("logout").then(() => {
+                // Swap panels back: sync options away, login card returns, fields re-enabled.
+                document.getElementById("syncButtons").style.display = "none"
+                const form = document.getElementById("loginForm")
+                form.style.display = "block"
+                form.querySelectorAll("input, .form-check-input").forEach(el => el.disabled = false)
+                document.getElementById("password").value = ""
+                statusHistory.add("Abgemeldet", "info")
+            })
+        }
 
         // ---------- Folder selection ----------
         function openFolderOverlay() {
