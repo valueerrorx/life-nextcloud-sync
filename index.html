@@ -449,6 +449,7 @@
             }
             walk(folderTree)
             listEl.innerHTML = rows.join("") || `<div class="text-muted text-center py-3">Keine Ordner gefunden.</div>`
+            setIndeterminateStates()
         }
 
         function folderRowHtml(n) {
@@ -503,14 +504,49 @@
             })
         }
 
-        // Independent selection: flipping a checkbox affects only that path. No cascading —
-        // a child stays selectable without its parent, and a parent selects its whole subtree implicitly.
+        function cascadeChecked(node, checked) {
+            node.checked = checked
+            for (const c of node.children) cascadeChecked(c, checked)
+        }
+
+        // Bottom-up: after any change, set each parent's checked = true only if ALL children are checked.
+        // Mixed or all-off → checked = false (so collectSelection only adds explicitly-fully-checked paths).
+        function syncParentStates(nodes) {
+            for (const n of nodes) {
+                if (n.children.length) {
+                    syncParentStates(n.children)
+                    n.checked = n.children.every(c => c.checked)
+                }
+            }
+        }
+
+        // A node is indeterminate if it has loaded children and they are in a mixed state.
+        function nodeIsIndeterminate(node) {
+            if (!node.children.length) return false
+            const someOn = node.children.some(c => c.checked || nodeIsIndeterminate(c))
+            const allOn = node.children.every(c => c.checked && !nodeIsIndeterminate(c))
+            return someOn && !allOn
+        }
+
+        function setIndeterminateStates() {
+            const walk = (nodes) => {
+                for (const n of nodes) {
+                    if (n.children.length) {
+                        walk(n.children)
+                        const id = "fcb_" + n.path.replace(/[^a-zA-Z0-9]/g, "_")
+                        const el = document.getElementById(id)
+                        if (el) el.indeterminate = nodeIsIndeterminate(n)
+                    }
+                }
+            }
+            walk(folderTree)
+        }
+
         function onFolderToggle(p, checked) {
             const node = findNode(folderTree, p)
             if (!node) return
-            node.checked = checked
-            // If a parent is turned off but a loaded child was relying on inheritance, keep the child's
-            // own explicit state untouched — nothing to cascade. Re-render to refresh the view.
+            cascadeChecked(node, checked)
+            syncParentStates(folderTree)
             renderFolderTree()
         }
 
