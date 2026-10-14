@@ -395,8 +395,7 @@ async function performSyncUp() {
     console.log('Syncing from local to Nextcloud...')
     win?.webContents?.send('sync-result', { status: 'info', message: 'Upload zu Nextcloud...' })
     
-    // Check for files to delete on server
-    const filesToDelete = await getFilesToDelete()
+    const filesToDelete = await getFilesToDelete(syncState) // Only previously synced files missing locally
     if (filesToDelete.length > 0) {
       const proceed = await confirmMassDeletion('Lokale Löschung erkannt', filesToDelete.length, filesToDelete.slice(0, 10))
       if (!proceed) {
@@ -465,25 +464,22 @@ async function confirmMassDeletion(title, count, preview) {
   }
 }
 
-// Helper function to get files that should be deleted on server
-async function getFilesToDelete() {
+// Remote files to delete: previously synced here, now missing locally. Remote-only additions stay.
+async function getFilesToDelete(syncState) {
   const localFiles = new Set()
   const remoteFiles = new Set()
-  
-  // Collect local files
+  const known = syncState?.files ?? {}
+
   await collectLocalFiles(localRoot, '', localFiles)
-  
-  // Collect remote files
   await collectRemoteFiles(client, '', remoteFiles)
-  
-  // Find files that exist on server but not locally
+
   const toDelete = []
   for (const remoteFile of remoteFiles) {
-    if (!localFiles.has(remoteFile) && !shouldExcludePath(remoteFile)) {
-      toDelete.push(remoteFile)
-    }
+    if (localFiles.has(remoteFile) || shouldExcludePath(remoteFile)) continue
+    if (!known[remoteFile]) continue // Never synced by this client → leave the remote file
+    toDelete.push(remoteFile)
   }
-  
+
   return toDelete
 }
 
